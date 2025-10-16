@@ -1498,6 +1498,11 @@ unsigned getMaxNumVGPRs(const MCSubtargetInfo *STI, unsigned WavesPerEU,
                 getVGPRAllocGranule(STI, DynamicVGPRBlockSize));
   unsigned AddressableNumVGPRs =
       getAddressableNumVGPRs(STI, DynamicVGPRBlockSize);
+  dbgs() << "MaxNumVGPRs = getTotalNumVGPRs(STI)/WavesPerEU = " <<
+      getTotalNumVGPRs(STI) << "/" << WavesPerEU << ", granule = " << 
+      getVGPRAllocGranule(STI, DynamicVGPRBlockSize) << "\n";
+  dbgs() << "AddressableNumVGPRs = " << AddressableNumVGPRs << ", DynamicVGPRBlockSize=" << 
+      DynamicVGPRBlockSize << "\n";
   return std::min(MaxNumVGPRs, AddressableNumVGPRs);
 }
 

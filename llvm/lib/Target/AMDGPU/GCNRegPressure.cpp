@@ -238,6 +238,7 @@ Printable llvm::print(const GCNRegPressure &RP, const GCNSubtarget *ST,
                       unsigned DynamicVGPRBlockSize) {
   return Printable([&RP, ST, DynamicVGPRBlockSize](raw_ostream &OS) {
     OS << "VGPRs: " << RP.getArchVGPRNum() << ' '
+       << "AVGPRs: " << RP.getAVGPRNum() << ' '
        << "AGPRs: " << RP.getAGPRNum();
     if (ST)
       OS << "(O"
