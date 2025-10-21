@@ -103,19 +103,11 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
       RelaxedOcc ? MFI.getMinAllowedOccupancy() : MFI.getOccupancy();
   SGPRCriticalLimit =
       std::min(ST.getMaxNumSGPRs(TargetOccupancy, true), SGPRExcessLimit);
-  dbgs() << "RelaxedOcc = " << RelaxedOcc << "\n";
-  dbgs() << "MFI.getMinAllowedOccupancy() = " << MFI.getMinAllowedOccupancy() << "\n";
-  dbgs() << "MFI.getOccupancy() = " << MFI.getOccupancy() << "\n";
-  dbgs() << "TargetOccupancy = " << TargetOccupancy << ", SGPRCritLim = " <<
-      SGPRCriticalLimit << "\n";
-  dbgs() << "KnownExcessRP = " << KnownExcessRP << "\n";
+
   if (!KnownExcessRP) {
     VGPRCriticalLimit = std::min(
         ST.getMaxNumVGPRs(TargetOccupancy, MFI.getDynamicVGPRBlockSize()),
         VGPRExcessLimit);
-    dbgs() << "1  VGPRCritLim = " << VGPRCriticalLimit << ", 1=" << 
-        ST.getMaxNumVGPRs(TargetOccupancy, MFI.getDynamicVGPRBlockSize()) << ", 1.1= " <<
-        MFI.getDynamicVGPRBlockSize() << "\n";
   } else {
     // This is similar to ST.getMaxNumVGPRs(TargetOccupancy) result except
     // returns a reasonably small number for targets with lots of VGPRs, such
@@ -123,19 +115,13 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
     LLVM_DEBUG(dbgs() << "Region is known to spill, use alternative "
                          "VGPRCriticalLimit calculation method.\n");
     unsigned DynamicVGPRBlockSize = MFI.getDynamicVGPRBlockSize();
-    dbgs() << "DynamicVGPRBlockSize = " << DynamicVGPRBlockSize << "\n";
     unsigned Granule =
         AMDGPU::IsaInfo::getVGPRAllocGranule(&ST, DynamicVGPRBlockSize);
-    dbgs() << "Granule = " << Granule << "\n";
     unsigned Addressable =
         AMDGPU::IsaInfo::getAddressableNumVGPRs(&ST, DynamicVGPRBlockSize);
-    dbgs() << "Addressable = " << Addressable << "\n";
     unsigned VGPRBudget = alignDown(Addressable / TargetOccupancy, Granule);
-    dbgs() << "VGPRBudget = " << VGPRBudget << "\n";
     VGPRBudget = std::max(VGPRBudget, Granule);
-    dbgs() << "VGPRBudget = " << VGPRBudget << "\n";
     VGPRCriticalLimit = std::min(VGPRBudget, VGPRExcessLimit);
-    dbgs() << "VGPRCriticalLimit = " << VGPRCriticalLimit << "\n";
   }
 
   // Subtract error margin and bias from register limits and avoid overflow.
@@ -143,8 +129,6 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
   VGPRCriticalLimit -= std::min(VGPRLimitBias + ErrorMargin, VGPRCriticalLimit);
   SGPRExcessLimit -= std::min(SGPRLimitBias + ErrorMargin, SGPRExcessLimit);
   VGPRExcessLimit -= std::min(VGPRLimitBias + ErrorMargin, VGPRExcessLimit);
-
-  dbgs() << "VGPRLimitBias = " << VGPRLimitBias << ", ErrorMargin = " << ErrorMargin << "\n";
 
   LLVM_DEBUG(dbgs() << "VGPRCriticalLimit = " << VGPRCriticalLimit
                     << ", VGPRExcessLimit = " << VGPRExcessLimit
