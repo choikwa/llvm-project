@@ -113,12 +113,37 @@ void SIPostRABundler::collectUsedRegUnits(const MachineInstr &MI,
 }
 
 bool SIPostRABundler::isBundleCandidate(const MachineInstr &MI) const {
+  // The fragment scheduler relies on the post-RA scheduler being able to
+  // position each DS_READ_B128 independently relative to its MFMA consumers.
+  // Do not let one of these reads start an indivisible memory bundle.
+  if (isMFMAFragmentSchedulerEnabled()) {
+    switch (MI.getOpcode()) {
+    case AMDGPU::DS_READ_B128:
+    case AMDGPU::DS_READ_B128_gfx9:
+      return false;
+    default:
+      break;
+    }
+  }
+
   const uint64_t IMemFlags = MI.getDesc().TSFlags & MemFlags;
   return IMemFlags != 0 && MI.mayLoadOrStore() && !MI.isBundled();
 }
 
 bool SIPostRABundler::canBundle(const MachineInstr &MI,
                                 const MachineInstr &NextMI) const {
+  // A DS_READ_B128 can also be absorbed into a bundle started by another
+  // memory instruction, so exclude it while extending bundles as well.
+  if (isMFMAFragmentSchedulerEnabled()) {
+    switch (NextMI.getOpcode()) {
+    case AMDGPU::DS_READ_B128:
+    case AMDGPU::DS_READ_B128_gfx9:
+      return false;
+    default:
+      break;
+    }
+  }
+
   const uint64_t IMemFlags = MI.getDesc().TSFlags & MemFlags;
 
   return (IMemFlags != 0 && MI.mayLoadOrStore() && !NextMI.isBundled() &&

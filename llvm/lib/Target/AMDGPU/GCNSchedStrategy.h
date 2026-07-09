@@ -71,6 +71,19 @@ protected:
   bool tryPendingCandidate(SchedCandidate &Cand, SchedCandidate &TryCand,
                            SchedBoundary *Zone) const;
 
+  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand,
+                    SchedBoundary *Zone) const override;
+
+  void dumpPickDebug(SchedBoundary &Zone, SUnit *SU, bool FromPending) const;
+
+  void updatePickDebugStats(SchedBoundary &Zone, SUnit *SU);
+
+  void updateFragmentWindow(SUnit *SU, bool IsTopNode);
+
+  void resetFragmentWindows();
+
+  void dumpPickDebugSummary();
+
   void printCandidateDecision(const SchedCandidate &Current,
                               const SchedCandidate &Preferred);
 
@@ -97,6 +110,40 @@ protected:
 
   // GCN RP Tracker for botttom-up scheduling
   mutable GCNUpwardRPTracker UpwardTracker;
+
+  struct FragmentWindowState {
+    unsigned LiveFragments = 0;
+    unsigned MaxLiveFragments = 0;
+    unsigned UsefulWindow = 4;
+    unsigned MaxWindow = 6;
+    const SUnit *LastDSRead = nullptr;
+    unsigned MFMAsSinceLastDSRead = 0;
+    unsigned UnrelatedMFMAsSinceLastDSRead = 0;
+    unsigned DSReadsSinceLastMFMA = 0;
+    DenseMap<const SUnit *, unsigned> RecentDSReadUnrelatedMFMAs;
+    DenseMap<const SUnit *, unsigned> DeferredDSReadFillers;
+    bool LastPickWasDSRead = false;
+    bool HasPickedMFMA = false;
+  };
+
+  struct PickDebugStats {
+    unsigned NumPicks = 0;
+    unsigned NumFutureReadyPicks = 0;
+    unsigned NumFutureReadyMFMAPicks = 0;
+    unsigned NumAvoidableFutureReadyMFMAPicks = 0;
+    unsigned NumAvoidableFutureReadyMFMAPicksWithPipeAlt = 0;
+    unsigned NumDSReadPicks = 0;
+    unsigned NumOverMaxDSReadPicks = 0;
+    unsigned NumMatureMFMAPicks = 0;
+    unsigned NumFutureMFMAPicks = 0;
+    unsigned TotalPickedReadyStall = 0;
+    unsigned MaxPickedReadyStall = 0;
+  };
+
+  FragmentWindowState TopFragmentWindow;
+  FragmentWindowState BotFragmentWindow;
+  PickDebugStats DebugStats;
+  CandReason DebugLastPickReason = NoCand;
 
 public:
   // schedule() have seen register pressure over the critical limits and had to

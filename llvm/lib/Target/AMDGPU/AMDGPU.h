@@ -22,6 +22,9 @@ class AMDGPUTargetMachine;
 class GCNTargetMachine;
 class TargetMachine;
 
+/// Whether the experimental DS_READ/MFMA fragment scheduling mode is enabled.
+bool isMFMAFragmentSchedulerEnabled();
+
 // GlobalISel passes
 void initializeAMDGPUPreLegalizerCombinerPass(PassRegistry &);
 FunctionPass *createAMDGPUPreLegalizeCombiner(bool IsOptNone);

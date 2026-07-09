@@ -24,12 +24,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "GCNSchedStrategy.h"
+#include "AMDGPU.h"
 #include "AMDGPUIGroupLP.h"
 #include "GCNRegPressure.h"
 #include "SIMachineFunctionInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
@@ -84,6 +86,47 @@ static cl::opt<unsigned> PendingQueueLimit(
         "Max (Available+Pending) size to inspect pending queue (0 disables)"),
     cl::init(256));
 
+static cl::opt<bool> EnableMFMAFragmentScheduler(
+    "amdgpu-enable-mfma-fragment-scheduler", cl::Hidden,
+    cl::desc("Enable experimental DS_READ/MFMA fragment scheduling"),
+    cl::init(false));
+
+bool llvm::isMFMAFragmentSchedulerEnabled() {
+  return EnableMFMAFragmentScheduler;
+}
+
+struct MFMAFragmentSchedSettings {
+  // Target size for the DS_READ/MFMA fragment window. The scheduler primes this
+  // many LDS operand fragments before preferring MFMA drain candidates, and also
+  // uses it as the maximum steady-state fragment window.
+  unsigned WindowSize = 8;
+
+  // Maximum DS_READ/MFMA fragment-window size before the first MFMA is picked
+  // in a scheduling region.
+  unsigned PrologueWindow = 4;
+
+  // Number of DS_READ producers with future MFMA consumers to place after
+  // first-MFMA operands but before picking a future first MFMA.
+  unsigned PrologueTailDS = 1;
+
+  // Steady-state group size for DS_READ/MFMA sequencing. The scheduler uses
+  // this as the preferred number of MFMA drain candidates after a DS_READ, the
+  // number of unrelated MFMAs to separate a DS_READ from its first MFMA use,
+  // the minimum number of MFMAs unlocked by pull-forward DS_READs, and the
+  // number of extra DS_READs that may fill an MFMA issue-resource stall.
+  unsigned SteadyStateMFMAs = 2;
+
+  // Maximum ReadyCycle stall allowed to pick a future MFMA over another DS_READ
+  // when the fragment window is overfull.
+  unsigned MaxFutureMFMAStall = 4;
+
+  // Maximum effective stall allowed when forcing an MFMA drain consumer over
+  // another DS_READ to maintain the fragment drain burst pattern.
+  unsigned MaxDrainMFMAStall = 8;
+};
+
+static constexpr MFMAFragmentSchedSettings MFMAFragmentSched;
+
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
 #define DUMP_MAX_REG_PRESSURE
 static cl::opt<bool> PrintMaxRPRegUsageBeforeScheduler(
@@ -114,6 +157,9 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
   GenericScheduler::initialize(DAG);
 
   MF = &DAG->MF;
+  resetFragmentWindows();
+  DebugStats = PickDebugStats();
+  DebugLastPickReason = NoCand;
 
   const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
 
@@ -194,6 +240,583 @@ static bool canUsePressureDiffs(const SUnit &SU) {
       return false;
   }
   return true;
+}
+
+static bool isTargetDSReadOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  case AMDGPU::DS_READ_B128:
+  case AMDGPU::DS_READ_B128_gfx9:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool isTargetMFMAOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  case AMDGPU::V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+template <typename PredicateT>
+static bool hasBundledMI(const MachineInstr *MI, PredicateT Predicate) {
+  if (!MI)
+    return false;
+
+  if (Predicate(*MI))
+    return true;
+
+  if (!MI->isBundle())
+    return false;
+
+  MachineBasicBlock::const_instr_iterator BundleI = MI->getIterator();
+  for (++BundleI;
+       BundleI != MI->getParent()->instr_end() && BundleI->isBundledWithPred();
+       ++BundleI) {
+    if (Predicate(*BundleI))
+      return true;
+  }
+
+  return false;
+}
+
+static bool isDSReadLike(const SUnit *SU) {
+  if (!SU)
+    return false;
+
+  return hasBundledMI(SU->getInstr(), [](const MachineInstr &MI) {
+    return isTargetDSReadOpcode(MI.getOpcode());
+  });
+}
+
+static bool isMFMALike(const SUnit *SU) {
+  if (!SU)
+    return false;
+
+  return hasBundledMI(SU->getInstr(), [](const MachineInstr &MI) {
+    return isTargetMFMAOpcode(MI.getOpcode());
+  });
+}
+
+static unsigned getBoundaryReadyCycle(const SchedBoundary &Zone,
+                                      const SUnit *SU) {
+  return Zone.isTop() ? SU->TopReadyCycle : SU->BotReadyCycle;
+}
+
+static unsigned getReadyStall(const SchedBoundary &Zone, const SUnit *SU) {
+  unsigned ReadyCycle = getBoundaryReadyCycle(Zone, SU);
+  unsigned CurrCycle = Zone.getCurrCycle();
+  return ReadyCycle > CurrCycle ? ReadyCycle - CurrCycle : 0;
+}
+
+static unsigned getIssueStall(SchedBoundary &Zone, SUnit *SU) {
+  if (!SU || !SU->hasReservedResource || !Zone.SchedModel ||
+      !Zone.SchedModel->hasInstrSchedModel())
+    return 0;
+
+  const MCSchedClassDesc *SC = Zone.DAG->getSchedClass(SU);
+  unsigned Stall = 0;
+  for (const MCWriteProcResEntry &PE :
+       make_range(Zone.SchedModel->getWriteProcResBegin(SC),
+                  Zone.SchedModel->getWriteProcResEnd(SC))) {
+    unsigned NextCycle;
+    unsigned InstanceIdx;
+    std::tie(NextCycle, InstanceIdx) = Zone.getNextResourceCycle(
+        SC, PE.ProcResourceIdx, PE.ReleaseAtCycle, PE.AcquireAtCycle);
+    (void)InstanceIdx;
+    if (NextCycle > Zone.getCurrCycle())
+      Stall = std::max(Stall, NextCycle - Zone.getCurrCycle());
+  }
+
+  return Stall;
+}
+
+static unsigned getEffectiveStall(SchedBoundary &Zone, SUnit *SU) {
+  return std::max(getReadyStall(Zone, SU), getIssueStall(Zone, SU));
+}
+
+static bool isFutureReady(const SchedBoundary &Zone, const SUnit *SU) {
+  return getReadyStall(Zone, SU) != 0;
+}
+
+static bool isMatureMFMA(const SchedBoundary &Zone, const SUnit *SU) {
+  return isMFMALike(SU) && !isFutureReady(Zone, SU);
+}
+
+static bool hasDSReadPred(const SUnit *SU, const SUnit *Pred) {
+  if (!isMFMALike(SU) || !isDSReadLike(Pred))
+    return false;
+
+  for (const SDep &PredDep : SU->Preds) {
+    if (PredDep.getSUnit() == Pred)
+      return true;
+  }
+
+  return false;
+}
+
+static bool hasScheduledMFMASuccessor(const SUnit *SU) {
+  if (!isDSReadLike(SU))
+    return false;
+
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (isMFMALike(Succ) && Succ->isScheduled)
+      return true;
+  }
+
+  return false;
+}
+
+enum class PipeKind {
+  None,
+  FragmentProducer,
+  MatureMFMA,
+  FutureMFMA,
+};
+
+static PipeKind classifyPipeKind(SchedBoundary &Zone, SUnit *SU) {
+  if (isDSReadLike(SU))
+    return PipeKind::FragmentProducer;
+
+  if (isMFMALike(SU))
+    return getReadyStall(Zone, SU) ? PipeKind::FutureMFMA
+                                   : PipeKind::MatureMFMA;
+
+  return PipeKind::None;
+}
+
+static const char *getPipeKindName(PipeKind Kind) {
+  switch (Kind) {
+  case PipeKind::None:
+    return "None";
+  case PipeKind::FragmentProducer:
+    return "FragmentProducer";
+  case PipeKind::MatureMFMA:
+    return "MatureMFMA";
+  case PipeKind::FutureMFMA:
+    return "FutureMFMA";
+  }
+  llvm_unreachable("unknown pipe kind");
+}
+
+static bool isUsefulReadyCandidate(SchedBoundary &Zone, SUnit *SU) {
+  return SU && getEffectiveStall(Zone, SU) == 0;
+}
+
+static bool isUsefulPipeCandidate(SchedBoundary &Zone, SUnit *SU) {
+  PipeKind Kind = classifyPipeKind(Zone, SU);
+  return Kind == PipeKind::FragmentProducer || Kind == PipeKind::MatureMFMA;
+}
+
+static unsigned getMinMFMASuccessorReadyCycle(const SUnit *SU) {
+  if (!isDSReadLike(SU))
+    return std::numeric_limits<unsigned>::max();
+
+  unsigned MinReadyCycle = std::numeric_limits<unsigned>::max();
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!isMFMALike(Succ))
+      continue;
+
+    MinReadyCycle = std::min(MinReadyCycle, Succ->TopReadyCycle);
+  }
+
+  return MinReadyCycle;
+}
+
+static unsigned getMFMASuccessorReadyDistance(const SchedBoundary &Zone,
+                                              const SUnit *SU) {
+  unsigned MinReadyCycle = getMinMFMASuccessorReadyCycle(SU);
+  if (MinReadyCycle == std::numeric_limits<unsigned>::max())
+    return MinReadyCycle;
+
+  unsigned CurrCycle = Zone.getCurrCycle();
+  return MinReadyCycle > CurrCycle ? MinReadyCycle - CurrCycle : 0;
+}
+
+static unsigned
+getMinUnscheduledDSReadPredsToMFMASuccessorAfter(const SUnit *SU) {
+  if (!isDSReadLike(SU))
+    return std::numeric_limits<unsigned>::max();
+
+  unsigned MinRemaining = std::numeric_limits<unsigned>::max();
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!isMFMALike(Succ) || Succ->isScheduled)
+      continue;
+
+    unsigned Remaining = 0;
+    for (const SDep &PredDep : Succ->Preds) {
+      const SUnit *Pred = PredDep.getSUnit();
+      if (!isDSReadLike(Pred) || Pred == SU || Pred->isScheduled)
+        continue;
+      ++Remaining;
+    }
+
+    MinRemaining = std::min(MinRemaining, Remaining);
+  }
+
+  return MinRemaining;
+}
+
+static unsigned
+countScheduledDSReadPredsToMFMASuccessorAfter(const SUnit *SU,
+                                              const SUnit *Succ) {
+  unsigned Count = 0;
+  for (const SDep &PredDep : Succ->Preds) {
+    const SUnit *Pred = PredDep.getSUnit();
+    if (!isDSReadLike(Pred))
+      continue;
+    if (Pred == SU || Pred->isScheduled)
+      ++Count;
+  }
+
+  return Count;
+}
+
+static unsigned
+countUnscheduledDSReadPredsToMFMASuccessorAfter(const SUnit *SU,
+                                                const SUnit *Succ) {
+  unsigned Count = 0;
+  for (const SDep &PredDep : Succ->Preds) {
+    const SUnit *Pred = PredDep.getSUnit();
+    if (!isDSReadLike(Pred) || Pred == SU || Pred->isScheduled)
+      continue;
+    ++Count;
+  }
+
+  return Count;
+}
+
+static bool
+hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(const SUnit *SU,
+                                                 const SUnit *Succ) {
+  for (const SDep &PredDep : Succ->Preds) {
+    const SUnit *Pred = PredDep.getSUnit();
+    if (isDSReadLike(Pred) || Pred == SU || Pred->isScheduled)
+      continue;
+    return true;
+  }
+
+  return false;
+}
+
+static unsigned countMFMASuccessorsUnlockedBy(const SUnit *SU) {
+  if (!isDSReadLike(SU))
+    return 0;
+
+  unsigned Count = 0;
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!isMFMALike(Succ) || Succ->isScheduled)
+      continue;
+
+    if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
+      continue;
+
+    if (countUnscheduledDSReadPredsToMFMASuccessorAfter(SU, Succ) == 0)
+      ++Count;
+  }
+
+  return Count;
+}
+
+static unsigned countMFMASuccessorsUnlockedByAfterFiller(const SUnit *SU,
+                                                         const SUnit *Filler) {
+  if (!isDSReadLike(SU) || !isMFMALike(Filler))
+    return 0;
+
+  unsigned Count = 0;
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!isMFMALike(Succ) || Succ->isScheduled || Succ == Filler)
+      continue;
+
+    bool HasFillerPred = false;
+    bool Blocked = false;
+    for (const SDep &PredDep : Succ->Preds) {
+      const SUnit *Pred = PredDep.getSUnit();
+      if (Pred == SU || Pred->isScheduled)
+        continue;
+
+      if (Pred == Filler) {
+        HasFillerPred = true;
+        continue;
+      }
+
+      Blocked = true;
+      break;
+    }
+
+    if (!Blocked && HasFillerPred)
+      ++Count;
+  }
+
+  return Count;
+}
+
+static unsigned getBestMFMASuccessorMissingDSReadPredsAfter(const SUnit *SU) {
+  if (!isDSReadLike(SU))
+    return std::numeric_limits<unsigned>::max();
+
+  unsigned BestMissing = std::numeric_limits<unsigned>::max();
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!isMFMALike(Succ) || Succ->isScheduled)
+      continue;
+
+    if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
+      continue;
+
+    unsigned Missing =
+        countUnscheduledDSReadPredsToMFMASuccessorAfter(SU, Succ);
+    BestMissing = std::min(BestMissing, Missing);
+  }
+
+  return BestMissing;
+}
+
+static unsigned getBestMFMASuccessorScheduledDSReadPredsAfter(const SUnit *SU) {
+  if (!isDSReadLike(SU))
+    return 0;
+
+  unsigned BestMissing = getBestMFMASuccessorMissingDSReadPredsAfter(SU);
+  if (BestMissing == std::numeric_limits<unsigned>::max())
+    return 0;
+
+  unsigned BestScheduled = 0;
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!isMFMALike(Succ) || Succ->isScheduled)
+      continue;
+
+    if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
+      continue;
+
+    if (countUnscheduledDSReadPredsToMFMASuccessorAfter(SU, Succ) !=
+        BestMissing)
+      continue;
+
+    BestScheduled = std::max(
+        BestScheduled, countScheduledDSReadPredsToMFMASuccessorAfter(SU, Succ));
+  }
+
+  return BestScheduled;
+}
+
+static unsigned getBestMFMASuccessorNodeNumAfter(const SUnit *SU) {
+  if (!isDSReadLike(SU))
+    return std::numeric_limits<unsigned>::max();
+
+  unsigned BestMissing = getBestMFMASuccessorMissingDSReadPredsAfter(SU);
+  if (BestMissing == std::numeric_limits<unsigned>::max())
+    return std::numeric_limits<unsigned>::max();
+
+  unsigned BestNodeNum = std::numeric_limits<unsigned>::max();
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!isMFMALike(Succ) || Succ->isScheduled)
+      continue;
+
+    if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
+      continue;
+
+    if (countUnscheduledDSReadPredsToMFMASuccessorAfter(SU, Succ) !=
+        BestMissing)
+      continue;
+
+    BestNodeNum = std::min(BestNodeNum, Succ->NodeNum);
+  }
+
+  return BestNodeNum;
+}
+
+static unsigned
+countMFMASuccessorsWithFewMissingDSReadPredsAfter(const SUnit *SU,
+                                                  unsigned MaxMissing) {
+  if (!isDSReadLike(SU))
+    return 0;
+
+  unsigned Count = 0;
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!isMFMALike(Succ) || Succ->isScheduled)
+      continue;
+
+    if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
+      continue;
+
+    unsigned Missing =
+        countUnscheduledDSReadPredsToMFMASuccessorAfter(SU, Succ);
+    if (Missing <= MaxMissing)
+      ++Count;
+  }
+
+  return Count;
+}
+
+struct MFMAFragmentProducerScore {
+  bool Valid = false;
+  unsigned BestSuccNode = std::numeric_limits<unsigned>::max();
+  unsigned BestMissingDS = std::numeric_limits<unsigned>::max();
+  unsigned BestScheduledDS = 0;
+  unsigned Unlocks = 0;
+  unsigned NearUnlocks = 0;
+};
+
+static MFMAFragmentProducerScore
+getDirectFragmentProducerScore(const SUnit *SU) {
+  MFMAFragmentProducerScore Score;
+  if (!isDSReadLike(SU))
+    return Score;
+
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!isMFMALike(Succ) || Succ->isScheduled)
+      continue;
+
+    unsigned Missing =
+        countUnscheduledDSReadPredsToMFMASuccessorAfter(SU, Succ);
+    unsigned Scheduled =
+        countScheduledDSReadPredsToMFMASuccessorAfter(SU, Succ);
+
+    Score.Valid = true;
+    if (Missing < Score.BestMissingDS) {
+      Score.BestMissingDS = Missing;
+      Score.BestSuccNode = Succ->NodeNum;
+      Score.BestScheduledDS = Scheduled;
+      continue;
+    }
+
+    if (Missing == Score.BestMissingDS) {
+      Score.BestSuccNode = std::min(Score.BestSuccNode, Succ->NodeNum);
+      Score.BestScheduledDS = std::max(Score.BestScheduledDS, Scheduled);
+    }
+  }
+
+  if (!Score.Valid)
+    return Score;
+
+  Score.Unlocks = countMFMASuccessorsUnlockedBy(SU);
+  Score.NearUnlocks = countMFMASuccessorsWithFewMissingDSReadPredsAfter(SU, 1);
+  return Score;
+}
+
+static unsigned countDSReadSpacingFillers(SchedBoundary &Zone,
+                                          const SUnit *DSRead) {
+  if (!isDSReadLike(DSRead))
+    return 0;
+
+  SmallPtrSet<SUnit *, 16> Seen;
+  unsigned Fillers = 0;
+  auto TryFiller = [&](SUnit *SU) {
+    if (!SU || SU->isScheduled || !Seen.insert(SU).second || !isMFMALike(SU))
+      return;
+    if (hasDSReadPred(SU, DSRead))
+      return;
+    if (getIssueStall(Zone, SU) != 0)
+      return;
+    if (getEffectiveStall(Zone, SU) > MFMAFragmentSched.MaxDrainMFMAStall)
+      return;
+
+    ++Fillers;
+  };
+
+  for (SUnit *SU : Zone.Available)
+    TryFiller(SU);
+  for (SUnit *SU : Zone.Pending)
+    TryFiller(SU);
+
+  return Fillers;
+}
+
+static bool isPrologueTailDSReadForFutureMFMA(SchedBoundary &Zone,
+                                              const SUnit *DSRead,
+                                              const SUnit *MFMA) {
+  if (!isDSReadLike(DSRead) || !isMFMALike(MFMA))
+    return false;
+  if (hasDSReadPred(MFMA, DSRead))
+    return false;
+  if (getEffectiveStall(Zone, const_cast<SUnit *>(DSRead)) != 0)
+    return false;
+  return getDirectFragmentProducerScore(DSRead).Valid;
+}
+
+static bool
+isBetterPrologueFragmentScore(const MFMAFragmentProducerScore &TryScore,
+                              const MFMAFragmentProducerScore &CandScore) {
+  if (TryScore.Valid != CandScore.Valid)
+    return TryScore.Valid;
+  if (!TryScore.Valid)
+    return false;
+
+  if (TryScore.BestMissingDS != CandScore.BestMissingDS)
+    return TryScore.BestMissingDS < CandScore.BestMissingDS;
+  if (TryScore.Unlocks != CandScore.Unlocks)
+    return TryScore.Unlocks > CandScore.Unlocks;
+  if (TryScore.BestScheduledDS != CandScore.BestScheduledDS)
+    return TryScore.BestScheduledDS > CandScore.BestScheduledDS;
+  if (TryScore.BestSuccNode != CandScore.BestSuccNode)
+    return TryScore.BestSuccNode < CandScore.BestSuccNode;
+  return false;
+}
+
+static bool mergePrologueFragmentScore(MFMAFragmentProducerScore &Best,
+                                       MFMAFragmentProducerScore TryScore) {
+  if (!TryScore.Valid)
+    return false;
+
+  if (!Best.Valid || isBetterPrologueFragmentScore(TryScore, Best)) {
+    Best = TryScore;
+    return true;
+  }
+
+  return false;
+}
+
+static MFMAFragmentProducerScore
+getReachableFragmentProducerScoreImpl(const SUnit *SU,
+                                      SmallPtrSetImpl<const SUnit *> &Visited,
+                                      unsigned DepthLeft) {
+  MFMAFragmentProducerScore Best;
+  if (!SU || SU->isScheduled || !Visited.insert(SU).second)
+    return Best;
+
+  mergePrologueFragmentScore(Best, getDirectFragmentProducerScore(SU));
+  if (!DepthLeft)
+    return Best;
+
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (!Succ || Succ->isScheduled || isMFMALike(Succ))
+      continue;
+
+    mergePrologueFragmentScore(Best, getReachableFragmentProducerScoreImpl(
+                                         Succ, Visited, DepthLeft - 1));
+  }
+
+  return Best;
+}
+
+static MFMAFragmentProducerScore
+getReachableFragmentProducerScore(const SUnit *SU) {
+  SmallPtrSet<const SUnit *, 8> Visited;
+  return getReachableFragmentProducerScoreImpl(SU, Visited, 6);
+}
+
+static void dumpMFMAFragmentProducerScore(raw_ostream &OS,
+                                          const MFMAFragmentProducerScore &S) {
+  OS << "{Valid=" << S.Valid << ",BestSucc=" << S.BestSuccNode
+     << ",MissingDS=" << S.BestMissingDS << ",ScheduledDS=" << S.BestScheduledDS
+     << ",Unlocks=" << S.Unlocks << ",NearUnlocks=" << S.NearUnlocks << "}";
+}
+
+static const char *getQueueName(bool FromPending) {
+  return FromPending ? "Pending" : "Available";
 }
 
 static void getRegisterPressures(
@@ -371,6 +994,1589 @@ static SUnit *pickOnlyChoice(SchedBoundary &Zone,
   return nullptr;
 }
 
+static SUnit *findPickDebugAlt(SchedBoundary &Zone, SUnit *Picked,
+                               bool &AltFromPending) {
+  SUnit *FirstAlt = nullptr;
+  bool FirstAltFromPending = false;
+  SUnit *FirstReadyAlt = nullptr;
+  bool FirstReadyAltFromPending = false;
+
+  for (SUnit *SU : Zone.Available) {
+    if (SU == Picked)
+      continue;
+    if (!FirstAlt) {
+      FirstAlt = SU;
+      FirstAltFromPending = false;
+    }
+    if (isUsefulReadyCandidate(Zone, SU) && !FirstReadyAlt) {
+      FirstReadyAlt = SU;
+      FirstReadyAltFromPending = false;
+    }
+    if (isUsefulReadyCandidate(Zone, SU) && isUsefulPipeCandidate(Zone, SU)) {
+      AltFromPending = false;
+      return SU;
+    }
+  }
+
+  for (SUnit *SU : Zone.Pending) {
+    if (SU == Picked)
+      continue;
+    if (!FirstAlt) {
+      FirstAlt = SU;
+      FirstAltFromPending = true;
+    }
+    if (isUsefulReadyCandidate(Zone, SU) && !FirstReadyAlt) {
+      FirstReadyAlt = SU;
+      FirstReadyAltFromPending = true;
+    }
+    if (isUsefulReadyCandidate(Zone, SU) && isUsefulPipeCandidate(Zone, SU)) {
+      AltFromPending = true;
+      return SU;
+    }
+  }
+
+  if (FirstReadyAlt) {
+    AltFromPending = FirstReadyAltFromPending;
+    return FirstReadyAlt;
+  }
+
+  AltFromPending = FirstAltFromPending;
+  return FirstAlt;
+}
+
+static bool hasUsefulReadyAlt(SchedBoundary &Zone, SUnit *Picked) {
+  for (SUnit *SU : Zone.Available)
+    if (SU != Picked && isUsefulReadyCandidate(Zone, SU))
+      return true;
+  for (SUnit *SU : Zone.Pending)
+    if (SU != Picked && isUsefulReadyCandidate(Zone, SU))
+      return true;
+  return false;
+}
+
+static bool hasUsefulPipeAlt(SchedBoundary &Zone, SUnit *Picked) {
+  for (SUnit *SU : Zone.Available)
+    if (SU != Picked && isUsefulReadyCandidate(Zone, SU) &&
+        isUsefulPipeCandidate(Zone, SU))
+      return true;
+  for (SUnit *SU : Zone.Pending)
+    if (SU != Picked && isUsefulReadyCandidate(Zone, SU) &&
+        isUsefulPipeCandidate(Zone, SU))
+      return true;
+  return false;
+}
+
+static bool hasMatureMFMAPending(SchedBoundary &Zone) {
+  for (SUnit *SU : Zone.Pending)
+    if (classifyPipeKind(Zone, SU) == PipeKind::MatureMFMA)
+      return true;
+  return false;
+}
+
+static bool
+shouldKeepAvailableUnlockingProducer(SchedBoundary &Zone, const SUnit *SU,
+                                     unsigned LiveFragments, unsigned MaxWindow,
+                                     bool LastPickWasDSRead, bool HasPickedMFMA,
+                                     unsigned MFMAsSinceLastDSRead,
+                                     const DenseMap<const SUnit *, unsigned>
+                                         &RecentDSReadUnrelatedMFMAs) {
+  return SU && isDSReadLike(SU) && HasPickedMFMA && !LastPickWasDSRead &&
+         MFMAsSinceLastDSRead >= MFMAFragmentSched.SteadyStateMFMAs &&
+         LiveFragments < MaxWindow && countMFMASuccessorsUnlockedBy(SU) != 0 &&
+         hasMatureMFMAPending(Zone);
+}
+
+static bool tryReadyStall(GenericSchedulerBase::SchedCandidate &TryCand,
+                          GenericSchedulerBase::SchedCandidate &Cand,
+                          SchedBoundary &Zone) {
+  if (!TryCand.SU || !Cand.SU)
+    return false;
+
+  unsigned TryStall = getReadyStall(Zone, TryCand.SU);
+  unsigned CandStall = getReadyStall(Zone, Cand.SU);
+  if (TryStall == CandStall)
+    return false;
+
+  if (tryLess(TryStall, CandStall, TryCand, Cand, GenericSchedulerBase::Stall))
+    return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+  return false;
+}
+
+static unsigned getRecentDSReadSpacing(
+    PipeKind Kind, const SUnit *SU,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  unsigned MinSpacing = MFMAFragmentSched.SteadyStateMFMAs;
+  unsigned BestSpacing = std::numeric_limits<unsigned>::max();
+  if (Kind != PipeKind::MatureMFMA && Kind != PipeKind::FutureMFMA)
+    return MinSpacing;
+  if (!MinSpacing)
+    return MinSpacing;
+
+  for (const auto &DSRead : RecentDSReadUnrelatedMFMAs)
+    if (hasDSReadPred(SU, DSRead.first))
+      BestSpacing = std::min(BestSpacing, DSRead.second);
+  if (BestSpacing == std::numeric_limits<unsigned>::max())
+    return MinSpacing;
+  return BestSpacing;
+}
+
+static bool hasRecentDSReadSpacingDebt(
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  if (!MFMAFragmentSched.SteadyStateMFMAs)
+    return false;
+
+  for (const auto &DSRead : RecentDSReadUnrelatedMFMAs)
+    if (DSRead.second < MFMAFragmentSched.SteadyStateMFMAs)
+      return true;
+
+  return false;
+}
+
+static bool consumesImmatureRecentDSRead(
+    const SUnit *SU,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  if (!isMFMALike(SU) || !MFMAFragmentSched.SteadyStateMFMAs)
+    return false;
+
+  for (const auto &DSRead : RecentDSReadUnrelatedMFMAs)
+    if (DSRead.second < MFMAFragmentSched.SteadyStateMFMAs &&
+        hasDSReadPred(SU, DSRead.first))
+      return true;
+
+  return false;
+}
+
+static bool isMFMAFragmentDrainCandidate(
+    SchedBoundary &Zone, SUnit *SU,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  PipeKind Kind = classifyPipeKind(Zone, SU);
+  if (Kind != PipeKind::MatureMFMA && Kind != PipeKind::FutureMFMA)
+    return false;
+
+  if (consumesImmatureRecentDSRead(SU, RecentDSReadUnrelatedMFMAs))
+    return false;
+
+  return getEffectiveStall(Zone, SU) <= MFMAFragmentSched.MaxDrainMFMAStall;
+}
+
+static unsigned countMFMAFragmentDrainCandidates(
+    SchedBoundary &Zone,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  SmallPtrSet<SUnit *, 16> Seen;
+  unsigned Count = 0;
+
+  auto TryCandidate = [&](SUnit *SU) {
+    if (!SU || SU->isScheduled || !Seen.insert(SU).second)
+      return;
+    if (isMFMAFragmentDrainCandidate(Zone, SU, RecentDSReadUnrelatedMFMAs))
+      ++Count;
+  };
+
+  for (SUnit *SU : Zone.Available)
+    TryCandidate(SU);
+  for (SUnit *SU : Zone.Pending)
+    TryCandidate(SU);
+
+  return Count;
+}
+
+static bool isRecentDSReadSpacingAlternative(
+    SchedBoundary &Zone, SUnit *SU,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  if (!SU || !MFMAFragmentSched.SteadyStateMFMAs ||
+      RecentDSReadUnrelatedMFMAs.empty())
+    return false;
+
+  PipeKind Kind = classifyPipeKind(Zone, SU);
+  if (Kind == PipeKind::FragmentProducer)
+    return getEffectiveStall(Zone, SU) == 0 &&
+           getDirectFragmentProducerScore(SU).Valid;
+
+  if (Kind != PipeKind::MatureMFMA && Kind != PipeKind::FutureMFMA)
+    return false;
+
+  if (consumesImmatureRecentDSRead(SU, RecentDSReadUnrelatedMFMAs))
+    return false;
+
+  if (getIssueStall(Zone, SU) != 0)
+    return false;
+
+  if (Kind == PipeKind::MatureMFMA)
+    return true;
+
+  return getEffectiveStall(Zone, SU) <= MFMAFragmentSched.MaxDrainMFMAStall;
+}
+
+static bool shouldPreferBoundaryForRecentDSReadSpacing(
+    SchedBoundary &PreferredZone,
+    GenericSchedulerBase::SchedCandidate &PreferredCand,
+    GenericSchedulerBase::SchedCandidate &OtherCand,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  if (!PreferredCand.isValid() ||
+      !OtherCand.isValid())
+    return false;
+
+  if (!consumesImmatureRecentDSRead(OtherCand.SU,
+                                    RecentDSReadUnrelatedMFMAs))
+    return false;
+
+  return isRecentDSReadSpacingAlternative(
+      PreferredZone, PreferredCand.SU, RecentDSReadUnrelatedMFMAs);
+}
+
+static bool isPullForwardUnlockingProducer(
+    SchedBoundary &Zone, SUnit *SU, unsigned LiveFragments,
+    unsigned UsefulWindow, bool LastPickWasDSRead, bool HasPickedMFMA,
+    bool AllowFullWindow,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  if (!MFMAFragmentSched.SteadyStateMFMAs)
+    return false;
+
+  if (!HasPickedMFMA || LastPickWasDSRead || !isDSReadLike(SU))
+    return false;
+
+  if (AllowFullWindow ? LiveFragments > UsefulWindow
+                      : LiveFragments >= UsefulWindow)
+    return false;
+
+  if (getEffectiveStall(Zone, SU) != 0)
+    return false;
+
+  if (!getDirectFragmentProducerScore(SU).Valid)
+    return false;
+
+  if (countMFMASuccessorsUnlockedBy(SU) < MFMAFragmentSched.SteadyStateMFMAs)
+    return false;
+
+  return countDSReadSpacingFillers(Zone, SU) >=
+         MFMAFragmentSched.SteadyStateMFMAs;
+}
+
+static bool isBetterPullForwardProducer(SchedBoundary &Zone, SUnit *Try,
+                                        SUnit *Cand) {
+  unsigned TryUnlocks = countMFMASuccessorsUnlockedBy(Try);
+  unsigned CandUnlocks = Cand ? countMFMASuccessorsUnlockedBy(Cand) : 0;
+  if (TryUnlocks != CandUnlocks)
+    return TryUnlocks > CandUnlocks;
+
+  unsigned TryFillers = countDSReadSpacingFillers(Zone, Try);
+  unsigned CandFillers = Cand ? countDSReadSpacingFillers(Zone, Cand) : 0;
+  if (TryFillers != CandFillers)
+    return TryFillers > CandFillers;
+
+  MFMAFragmentProducerScore TryScore = getReachableFragmentProducerScore(Try);
+  MFMAFragmentProducerScore CandScore = getReachableFragmentProducerScore(Cand);
+  if (isBetterPrologueFragmentScore(TryScore, CandScore))
+    return true;
+  if (isBetterPrologueFragmentScore(CandScore, TryScore))
+    return false;
+
+  return !Cand || Try->NodeNum < Cand->NodeNum;
+}
+
+static SUnit *findPullForwardUnlockingProducer(
+    SchedBoundary &Zone, GenericSchedulerBase::SchedCandidate &Cand,
+    unsigned LiveFragments, unsigned UsefulWindow, bool LastPickWasDSRead,
+    bool HasPickedMFMA,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  if (!Cand.isValid())
+    return nullptr;
+
+  PipeKind CandK = classifyPipeKind(Zone, Cand.SU);
+  if (CandK != PipeKind::None && CandK != PipeKind::FragmentProducer &&
+      CandK != PipeKind::MatureMFMA)
+    return nullptr;
+
+  bool AllowFullWindow = CandK == PipeKind::MatureMFMA;
+  if (isPullForwardUnlockingProducer(Zone, Cand.SU, LiveFragments,
+                                     UsefulWindow, LastPickWasDSRead,
+                                     HasPickedMFMA, AllowFullWindow,
+                                     RecentDSReadUnrelatedMFMAs))
+    return nullptr;
+
+  SUnit *Best = nullptr;
+  for (SUnit *SU : Zone.Available) {
+    bool IsPullForwardProducer = isPullForwardUnlockingProducer(
+        Zone, SU, LiveFragments, UsefulWindow, LastPickWasDSRead,
+        HasPickedMFMA, AllowFullWindow, RecentDSReadUnrelatedMFMAs);
+    LLVM_DEBUG({
+      if (isDSReadLike(SU) &&
+          countMFMASuccessorsUnlockedBy(SU) >= MFMAFragmentSched.SteadyStateMFMAs)
+        dbgs() << "AMDGPU-SCHED-PULL-FWD-CHECK "
+               << (Zone.isTop() ? "Top" : "Bot") << " SU(" << SU->NodeNum
+               << ") CandSU=" << Cand.SU->NodeNum
+               << " CandKind=" << getPipeKindName(CandK)
+               << " Live=" << LiveFragments << " Useful=" << UsefulWindow
+               << " AllowFullWindow=" << AllowFullWindow
+               << " LastPickWasDSRead=" << LastPickWasDSRead
+               << " HasPickedMFMA=" << HasPickedMFMA
+               << " EffectiveStall=" << getEffectiveStall(Zone, SU)
+               << " DirectValid=" << getDirectFragmentProducerScore(SU).Valid
+               << " Unlocks=" << countMFMASuccessorsUnlockedBy(SU)
+               << " Fillers=" << countDSReadSpacingFillers(Zone, SU)
+               << " Qualifies=" << IsPullForwardProducer << '\n';
+    });
+
+    if (!IsPullForwardProducer)
+      continue;
+
+    if (!Best || isBetterPullForwardProducer(Zone, SU, Best))
+      Best = SU;
+  }
+
+  return Best;
+}
+
+static bool tryRecentDSReadSpacing(
+    GenericSchedulerBase::SchedCandidate &TryCand,
+    GenericSchedulerBase::SchedCandidate &Cand, SchedBoundary &Zone,
+    bool HasPickedMFMA,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  if (!TryCand.SU || !Cand.SU || !HasPickedMFMA ||
+      !MFMAFragmentSched.SteadyStateMFMAs || RecentDSReadUnrelatedMFMAs.empty())
+    return false;
+
+  PipeKind TryK = classifyPipeKind(Zone, TryCand.SU);
+  PipeKind CandK = classifyPipeKind(Zone, Cand.SU);
+  if ((TryK != PipeKind::MatureMFMA && TryK != PipeKind::FutureMFMA) ||
+      (CandK != PipeKind::MatureMFMA && CandK != PipeKind::FutureMFMA))
+    return false;
+
+  unsigned TrySpacing =
+      getRecentDSReadSpacing(TryK, TryCand.SU, RecentDSReadUnrelatedMFMAs);
+  unsigned CandSpacing =
+      getRecentDSReadSpacing(CandK, Cand.SU, RecentDSReadUnrelatedMFMAs);
+  if (TrySpacing == CandSpacing)
+    return false;
+
+  if (tryGreater(TrySpacing, CandSpacing, TryCand, Cand,
+                 GenericSchedulerBase::Stall))
+    return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+  return false;
+}
+
+static bool tryFragmentWindowBalance(
+    GenericSchedulerBase::SchedCandidate &TryCand,
+    GenericSchedulerBase::SchedCandidate &Cand, SchedBoundary &Zone,
+    unsigned LiveFragments, unsigned UsefulWindow, unsigned MaxWindow,
+    const SUnit *LastDSRead, bool LastPickWasDSRead, bool HasPickedMFMA,
+    unsigned MFMAsSinceLastDSRead, unsigned UnrelatedMFMAsSinceLastDSRead,
+    unsigned DSReadsSinceLastMFMA,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs,
+    bool EnablePrologueSetupBias) {
+  if (!TryCand.SU || !Cand.SU)
+    return false;
+
+  PipeKind TryK = classifyPipeKind(Zone, TryCand.SU);
+  PipeKind CandK = classifyPipeKind(Zone, Cand.SU);
+  auto ShouldStaggerFutureMFMA = [&](PipeKind Kind, const SUnit *SU) {
+    return Kind == PipeKind::FutureMFMA && LastPickWasDSRead && HasPickedMFMA &&
+           hasDSReadPred(SU, LastDSRead);
+  };
+
+  bool TryStagger = ShouldStaggerFutureMFMA(TryK, TryCand.SU);
+  bool CandStagger = ShouldStaggerFutureMFMA(CandK, Cand.SU);
+  bool TryProducer = TryK == PipeKind::FragmentProducer;
+  bool CandProducer = CandK == PipeKind::FragmentProducer;
+  auto IsIssueReadyMatureMFMA = [&](PipeKind Kind, SUnit *SU) {
+    return Kind == PipeKind::MatureMFMA && getIssueStall(Zone, SU) == 0;
+  };
+  bool TryFiller = IsIssueReadyMatureMFMA(TryK, TryCand.SU);
+  bool CandFiller = IsIssueReadyMatureMFMA(CandK, Cand.SU);
+  unsigned EffectiveUsefulWindow =
+      HasPickedMFMA
+          ? UsefulWindow
+          : std::min(UsefulWindow, MFMAFragmentSched.PrologueWindow);
+  bool IsSteadyState = HasPickedMFMA || LiveFragments >= EffectiveUsefulWindow;
+  unsigned EffectiveMaxWindow =
+      IsSteadyState ? EffectiveUsefulWindow : MaxWindow;
+  bool HasDrainBacklog = false;
+  auto IsDrainBurstMFMA = [&](PipeKind Kind, SUnit *SU) {
+    if (Kind == PipeKind::MatureMFMA)
+      return getIssueStall(Zone, SU) == 0;
+    if (Kind != PipeKind::FutureMFMA)
+      return false;
+    if (getIssueStall(Zone, SU) != 0)
+      return false;
+    return getEffectiveStall(Zone, SU) <= MFMAFragmentSched.MaxDrainMFMAStall;
+  };
+  bool TryDrainBurstMFMA = IsDrainBurstMFMA(TryK, TryCand.SU);
+  bool CandDrainBurstMFMA = IsDrainBurstMFMA(CandK, Cand.SU);
+  auto ConsumesImmatureRecentDSRead = [&](PipeKind Kind, const SUnit *SU) {
+    if (Kind != PipeKind::MatureMFMA && Kind != PipeKind::FutureMFMA)
+      return false;
+    return consumesImmatureRecentDSRead(SU, RecentDSReadUnrelatedMFMAs);
+  };
+  bool TryConsumesImmatureDSRead =
+      ConsumesImmatureRecentDSRead(TryK, TryCand.SU);
+  bool CandConsumesImmatureDSRead =
+      ConsumesImmatureRecentDSRead(CandK, Cand.SU);
+  unsigned TryRecentDSReadSpacing =
+      getRecentDSReadSpacing(TryK, TryCand.SU, RecentDSReadUnrelatedMFMAs);
+  unsigned CandRecentDSReadSpacing =
+      getRecentDSReadSpacing(CandK, Cand.SU, RecentDSReadUnrelatedMFMAs);
+  bool TryUnrelatedDrainMFMA = TryDrainBurstMFMA && !TryConsumesImmatureDSRead;
+  bool CandUnrelatedDrainMFMA =
+      CandDrainBurstMFMA && !CandConsumesImmatureDSRead;
+  auto IsUsefulSpacingProducer = [&](PipeKind Kind, SUnit *SU) {
+    return Kind == PipeKind::FragmentProducer && HasPickedMFMA &&
+           MFMAFragmentSched.SteadyStateMFMAs && getEffectiveStall(Zone, SU) == 0 &&
+           LiveFragments < MaxWindow && getDirectFragmentProducerScore(SU).Valid;
+  };
+  bool TryUsefulSpacingProducer =
+      IsUsefulSpacingProducer(TryK, TryCand.SU);
+  bool CandUsefulSpacingProducer =
+      IsUsefulSpacingProducer(CandK, Cand.SU);
+  auto IsUnderfilledSpacingProducer = [&](PipeKind Kind, SUnit *SU) {
+    return Kind == PipeKind::FragmentProducer && HasPickedMFMA &&
+           MFMAFragmentSched.SteadyStateMFMAs && !LastPickWasDSRead &&
+           getEffectiveStall(Zone, SU) == 0 &&
+           getDirectFragmentProducerScore(SU).Valid &&
+           countDSReadSpacingFillers(Zone, SU) <
+               MFMAFragmentSched.SteadyStateMFMAs;
+  };
+  bool TryUnderfilledSpacingProducer =
+      IsUnderfilledSpacingProducer(TryK, TryCand.SU);
+  bool CandUnderfilledSpacingProducer =
+      IsUnderfilledSpacingProducer(CandK, Cand.SU);
+  auto IsHideableUnlockingProducer = [&](PipeKind Kind, const SUnit *SU,
+                                         const SUnit *Filler) {
+    return Kind == PipeKind::FragmentProducer && HasPickedMFMA &&
+           !HasDrainBacklog && !LastPickWasDSRead &&
+           MFMAsSinceLastDSRead >= MFMAFragmentSched.SteadyStateMFMAs &&
+           LiveFragments < EffectiveMaxWindow &&
+           (countMFMASuccessorsUnlockedBy(SU) != 0 ||
+            countMFMASuccessorsUnlockedByAfterFiller(SU, Filler) != 0);
+  };
+  bool TryHideableProducer =
+      IsHideableUnlockingProducer(TryK, TryCand.SU, Cand.SU);
+  bool CandHideableProducer =
+      IsHideableUnlockingProducer(CandK, Cand.SU, TryCand.SU);
+
+  if (!HasPickedMFMA &&
+      MFMAFragmentSched.PrologueTailDS &&
+      LiveFragments >= EffectiveUsefulWindow &&
+      LiveFragments < EffectiveUsefulWindow + MFMAFragmentSched.PrologueTailDS &&
+      ((TryK == PipeKind::FutureMFMA && CandProducer) ||
+       (CandK == PipeKind::FutureMFMA && TryProducer))) {
+    SUnit *FutureMFMA = TryK == PipeKind::FutureMFMA ? TryCand.SU : Cand.SU;
+    SUnit *Producer = TryProducer ? TryCand.SU : Cand.SU;
+    if (getIssueStall(Zone, FutureMFMA) == 0 &&
+        isPrologueTailDSReadForFutureMFMA(Zone, Producer, FutureMFMA)) {
+      if (TryProducer) {
+        TryCand.Reason = GenericSchedulerBase::Stall;
+        return true;
+      }
+
+      Cand.Reason = GenericSchedulerBase::Stall;
+      return false;
+    }
+  }
+
+  if (!HasPickedMFMA &&
+      LiveFragments >= EffectiveUsefulWindow && (TryProducer || CandProducer) &&
+      TryK != CandK) {
+    SUnit *ProducerSU = TryProducer ? TryCand.SU : Cand.SU;
+    bool ProducerUnlocks = countMFMASuccessorsUnlockedBy(ProducerSU) != 0;
+    if (!ProducerUnlocks) {
+      if (!TryProducer) {
+        TryCand.Reason = GenericSchedulerBase::TopPathReduce;
+        return true;
+      }
+
+      Cand.Reason = GenericSchedulerBase::TopPathReduce;
+      return false;
+    }
+  }
+
+  if (EnablePrologueSetupBias &&
+      !HasPickedMFMA && LiveFragments == 0 && TryProducer != CandProducer) {
+    SUnit *ProducerSU = TryProducer ? TryCand.SU : Cand.SU;
+    SUnit *SetupSU = TryProducer ? Cand.SU : TryCand.SU;
+    MFMAFragmentProducerScore ProducerScore =
+        getReachableFragmentProducerScore(ProducerSU);
+    MFMAFragmentProducerScore SetupScore =
+        getReachableFragmentProducerScore(SetupSU);
+
+    if (SetupScore.Valid &&
+        !isBetterPrologueFragmentScore(ProducerScore, SetupScore)) {
+      if (!TryProducer) {
+        TryCand.Reason = GenericSchedulerBase::TopPathReduce;
+        return true;
+      }
+
+      Cand.Reason = GenericSchedulerBase::TopPathReduce;
+      return false;
+    }
+  }
+
+  if (!HasPickedMFMA) {
+    MFMAFragmentProducerScore TryScore =
+        getReachableFragmentProducerScore(TryCand.SU);
+    MFMAFragmentProducerScore CandScore =
+        getReachableFragmentProducerScore(Cand.SU);
+
+    if (isBetterPrologueFragmentScore(TryScore, CandScore)) {
+      TryCand.Reason = GenericSchedulerBase::TopPathReduce;
+      return true;
+    }
+
+    if (isBetterPrologueFragmentScore(CandScore, TryScore)) {
+      Cand.Reason = GenericSchedulerBase::TopPathReduce;
+      return false;
+    }
+
+    if (EnablePrologueSetupBias && TryK == PipeKind::None &&
+        CandK == PipeKind::None && TryScore.Valid && CandScore.Valid &&
+        TryCand.SU->getHeight() != Cand.SU->getHeight()) {
+      if (tryLess(TryCand.SU->getHeight(), Cand.SU->getHeight(), TryCand, Cand,
+                  GenericSchedulerBase::TopPathReduce))
+        return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+      return false;
+    }
+  }
+
+  if (TryK == PipeKind::FragmentProducer &&
+      CandK == PipeKind::FragmentProducer &&
+      (!HasPickedMFMA || !HasDrainBacklog)) {
+    MFMAFragmentProducerScore TryScore =
+        getReachableFragmentProducerScore(TryCand.SU);
+    MFMAFragmentProducerScore CandScore =
+        getReachableFragmentProducerScore(Cand.SU);
+
+    if (isBetterPrologueFragmentScore(TryScore, CandScore)) {
+      TryCand.Reason = GenericSchedulerBase::TopPathReduce;
+      return true;
+    }
+
+    if (isBetterPrologueFragmentScore(CandScore, TryScore)) {
+      Cand.Reason = GenericSchedulerBase::TopPathReduce;
+      return false;
+    }
+  }
+
+  if (HasPickedMFMA && IsSteadyState && MFMAFragmentSched.SteadyStateMFMAs &&
+      !RecentDSReadUnrelatedMFMAs.empty()) {
+    if (TryDrainBurstMFMA && CandDrainBurstMFMA &&
+        TryRecentDSReadSpacing != CandRecentDSReadSpacing) {
+      if (tryGreater(TryRecentDSReadSpacing, CandRecentDSReadSpacing, TryCand,
+                     Cand, GenericSchedulerBase::Stall))
+        return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+      return false;
+    }
+
+    if (TryConsumesImmatureDSRead && CandUnrelatedDrainMFMA) {
+      Cand.Reason = GenericSchedulerBase::Stall;
+      return true;
+    }
+
+    if (CandConsumesImmatureDSRead && TryUnrelatedDrainMFMA) {
+      TryCand.Reason = GenericSchedulerBase::Stall;
+      return true;
+    }
+
+    if (TryConsumesImmatureDSRead && CandUsefulSpacingProducer) {
+      Cand.Reason = GenericSchedulerBase::Stall;
+      return true;
+    }
+
+    if (CandConsumesImmatureDSRead && TryUsefulSpacingProducer) {
+      TryCand.Reason = GenericSchedulerBase::Stall;
+      return true;
+    }
+  }
+
+  if (TryStagger && CandFiller) {
+    Cand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  if (CandStagger && TryFiller) {
+    TryCand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  if (TryStagger && CandProducer && getEffectiveStall(Zone, Cand.SU) == 0) {
+    Cand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  if (CandStagger && TryProducer && getEffectiveStall(Zone, TryCand.SU) == 0) {
+    TryCand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  if (TryUnderfilledSpacingProducer && CandUnrelatedDrainMFMA) {
+    Cand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  if (CandUnderfilledSpacingProducer && TryUnrelatedDrainMFMA) {
+    TryCand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  if (TryHideableProducer && CandFiller) {
+    TryCand.Reason = GenericSchedulerBase::TopPathReduce;
+    return true;
+  }
+
+  if (CandHideableProducer && TryFiller) {
+    Cand.Reason = GenericSchedulerBase::TopPathReduce;
+    return true;
+  }
+
+  if (HasPickedMFMA && LastPickWasDSRead &&
+      MFMAsSinceLastDSRead < MFMAFragmentSched.SteadyStateMFMAs &&
+      ((TryDrainBurstMFMA && CandProducer) ||
+       (CandDrainBurstMFMA && TryProducer))) {
+    if (TryDrainBurstMFMA) {
+      TryCand.Reason = GenericSchedulerBase::TopPathReduce;
+      return true;
+    }
+
+    Cand.Reason = GenericSchedulerBase::TopPathReduce;
+    return false;
+  }
+
+  if (HasPickedMFMA && !LastPickWasDSRead &&
+      MFMAsSinceLastDSRead < MFMAFragmentSched.SteadyStateMFMAs &&
+      ((TryDrainBurstMFMA && CandProducer) ||
+       (CandDrainBurstMFMA && TryProducer))) {
+    if (TryDrainBurstMFMA) {
+      TryCand.Reason = GenericSchedulerBase::TopPathReduce;
+      return true;
+    }
+
+    Cand.Reason = GenericSchedulerBase::TopPathReduce;
+    return false;
+  }
+
+  auto IsIssueStalledMatureMFMA = [&](PipeKind Kind, SUnit *SU) {
+    return Kind == PipeKind::MatureMFMA && getIssueStall(Zone, SU) != 0;
+  };
+
+  bool TryIssueStalledMFMA = IsIssueStalledMatureMFMA(TryK, TryCand.SU);
+  bool CandIssueStalledMFMA = IsIssueStalledMatureMFMA(CandK, Cand.SU);
+  if ((TryIssueStalledMFMA && CandProducer) ||
+      (CandIssueStalledMFMA && TryProducer)) {
+    bool TryIsProducer = TryProducer;
+    SUnit *ProducerSU = TryIsProducer ? TryCand.SU : Cand.SU;
+    SUnit *MFMA = TryIssueStalledMFMA ? TryCand.SU : Cand.SU;
+    unsigned ProducerStall = getEffectiveStall(Zone, ProducerSU);
+    unsigned MFMAIssueStall = getIssueStall(Zone, MFMA);
+    bool HasWindowHeadroom =
+        !HasPickedMFMA || LiveFragments < EffectiveMaxWindow;
+    bool CanFillIssueGap =
+        ProducerStall <= MFMAIssueStall && HasWindowHeadroom &&
+        (!HasPickedMFMA ||
+         DSReadsSinceLastMFMA < MFMAFragmentSched.SteadyStateMFMAs);
+
+    if (CanFillIssueGap) {
+      if (TryIsProducer) {
+        TryCand.Reason = GenericSchedulerBase::Stall;
+        return true;
+      }
+
+      Cand.Reason = GenericSchedulerBase::Stall;
+      return true;
+    }
+
+    if (TryIssueStalledMFMA) {
+      TryCand.Reason = GenericSchedulerBase::RegExcess;
+      return true;
+    }
+
+    Cand.Reason = GenericSchedulerBase::RegExcess;
+    return true;
+  }
+
+  if (TryIssueStalledMFMA && CandIssueStalledMFMA) {
+    unsigned TryIssueStall = getIssueStall(Zone, TryCand.SU);
+    unsigned CandIssueStall = getIssueStall(Zone, Cand.SU);
+    if (TryIssueStall != CandIssueStall) {
+      if (tryLess(TryIssueStall, CandIssueStall, TryCand, Cand,
+                  GenericSchedulerBase::Stall))
+        return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+      return false;
+    }
+  }
+
+  if (LiveFragments >= EffectiveMaxWindow) {
+    auto IsHardCapDrainMFMA = [&Zone](PipeKind Kind, SUnit *SU) {
+      if (Kind == PipeKind::MatureMFMA)
+        return true;
+      if (Kind != PipeKind::FutureMFMA || !MFMAFragmentSched.MaxFutureMFMAStall)
+        return false;
+      if (getIssueStall(Zone, SU) != 0)
+        return false;
+      return getEffectiveStall(Zone, SU) <= MFMAFragmentSched.MaxFutureMFMAStall;
+    };
+
+    bool TryMFMA = IsHardCapDrainMFMA(TryK, TryCand.SU);
+    bool CandMFMA = IsHardCapDrainMFMA(CandK, Cand.SU);
+    if ((TryMFMA && CandProducer) || (CandMFMA && TryProducer)) {
+      if (TryMFMA) {
+        TryCand.Reason = GenericSchedulerBase::RegExcess;
+        return true;
+      }
+
+      Cand.Reason = GenericSchedulerBase::RegExcess;
+      return true;
+    }
+
+    if (TryMFMA && CandMFMA)
+      return tryReadyStall(TryCand, Cand, Zone);
+  }
+
+  if (MFMAFragmentSched.MaxFutureMFMAStall && LiveFragments >= UsefulWindow) {
+    bool TryFutureMFMA = TryK == PipeKind::FutureMFMA;
+    bool CandFutureMFMA = CandK == PipeKind::FutureMFMA;
+    bool TryProducer = TryK == PipeKind::FragmentProducer;
+    bool CandProducer = CandK == PipeKind::FragmentProducer;
+
+    if ((TryFutureMFMA && CandProducer) || (CandFutureMFMA && TryProducer)) {
+      SUnit *FutureSU = TryFutureMFMA ? TryCand.SU : Cand.SU;
+      unsigned FutureStall = getEffectiveStall(Zone, FutureSU);
+      if (FutureStall > MFMAFragmentSched.MaxFutureMFMAStall ||
+          getIssueStall(Zone, FutureSU) != 0) {
+        if (TryFutureMFMA) {
+          Cand.Reason = GenericSchedulerBase::Stall;
+          return true;
+        }
+
+        TryCand.Reason = GenericSchedulerBase::Stall;
+        return true;
+      }
+
+      if (FutureStall <= MFMAFragmentSched.MaxFutureMFMAStall) {
+        if (TryFutureMFMA) {
+          TryCand.Reason = GenericSchedulerBase::Stall;
+          return true;
+        }
+
+        Cand.Reason = GenericSchedulerBase::Stall;
+        return true;
+      }
+    }
+  }
+
+  if (TryK == PipeKind::FragmentProducer &&
+      CandK == PipeKind::FragmentProducer) {
+    unsigned TryBestMissing =
+        getBestMFMASuccessorMissingDSReadPredsAfter(TryCand.SU);
+    unsigned CandBestMissing =
+        getBestMFMASuccessorMissingDSReadPredsAfter(Cand.SU);
+    if (TryBestMissing != CandBestMissing) {
+      if (tryLess(TryBestMissing, CandBestMissing, TryCand, Cand,
+                  GenericSchedulerBase::TopPathReduce))
+        return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+      return false;
+    }
+
+    unsigned TrySuccNode = getBestMFMASuccessorNodeNumAfter(TryCand.SU);
+    unsigned CandSuccNode = getBestMFMASuccessorNodeNumAfter(Cand.SU);
+    if (TrySuccNode != CandSuccNode) {
+      if (tryLess(TrySuccNode, CandSuccNode, TryCand, Cand,
+                  GenericSchedulerBase::TopPathReduce))
+        return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+      return false;
+    }
+
+    unsigned TryScheduled =
+        getBestMFMASuccessorScheduledDSReadPredsAfter(TryCand.SU);
+    unsigned CandScheduled =
+        getBestMFMASuccessorScheduledDSReadPredsAfter(Cand.SU);
+    if (TryScheduled != CandScheduled) {
+      if (tryGreater(TryScheduled, CandScheduled, TryCand, Cand,
+                     GenericSchedulerBase::TopPathReduce))
+        return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+      return false;
+    }
+
+    if (!HasDrainBacklog) {
+      unsigned TryUnlocks = countMFMASuccessorsUnlockedBy(TryCand.SU);
+      unsigned CandUnlocks = countMFMASuccessorsUnlockedBy(Cand.SU);
+      if (TryUnlocks != CandUnlocks) {
+        if (tryGreater(TryUnlocks, CandUnlocks, TryCand, Cand,
+                       GenericSchedulerBase::TopPathReduce))
+          return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+        return false;
+      }
+    }
+
+    unsigned TryRemaining =
+        getMinUnscheduledDSReadPredsToMFMASuccessorAfter(TryCand.SU);
+    unsigned CandRemaining =
+        getMinUnscheduledDSReadPredsToMFMASuccessorAfter(Cand.SU);
+    if (TryRemaining != CandRemaining) {
+      if (tryLess(TryRemaining, CandRemaining, TryCand, Cand,
+                  GenericSchedulerBase::TopPathReduce))
+        return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+      return false;
+    }
+  }
+
+  if (TryK == PipeKind::FutureMFMA || CandK == PipeKind::FutureMFMA) {
+    if (TryK != CandK) {
+      if (TryK != PipeKind::FutureMFMA) {
+        TryCand.Reason = GenericSchedulerBase::Stall;
+        return true;
+      }
+
+      Cand.Reason = GenericSchedulerBase::Stall;
+      return false;
+    }
+
+    return tryReadyStall(TryCand, Cand, Zone);
+  }
+
+  if (LiveFragments < EffectiveUsefulWindow &&
+      (TryK == PipeKind::FragmentProducer ||
+       CandK == PipeKind::FragmentProducer)) {
+    if (TryK != CandK) {
+      if (TryK == PipeKind::FragmentProducer) {
+        TryCand.Reason = GenericSchedulerBase::TopPathReduce;
+        return true;
+      }
+
+      Cand.Reason = GenericSchedulerBase::TopPathReduce;
+      return false;
+    }
+  }
+
+  if (LiveFragments >= EffectiveUsefulWindow && (TryFiller || CandFiller)) {
+    if (TryFiller != CandFiller) {
+      if (TryFiller) {
+        TryCand.Reason = GenericSchedulerBase::TopPathReduce;
+        return true;
+      }
+
+      Cand.Reason = GenericSchedulerBase::TopPathReduce;
+      return false;
+    }
+  }
+
+  if (LiveFragments >= EffectiveMaxWindow &&
+      (TryK == PipeKind::FragmentProducer ||
+       CandK == PipeKind::FragmentProducer)) {
+    if (TryK != CandK) {
+      if (TryK != PipeKind::FragmentProducer) {
+        TryCand.Reason = GenericSchedulerBase::RegExcess;
+        return true;
+      }
+
+      Cand.Reason = GenericSchedulerBase::RegExcess;
+      return false;
+    }
+  }
+
+  return false;
+}
+
+static bool tryMFMAFragmentHeuristic(
+    GenericSchedulerBase::SchedCandidate &TryCand,
+    GenericSchedulerBase::SchedCandidate &Cand, SchedBoundary &Zone,
+    unsigned LiveFragments, unsigned UsefulWindow, unsigned MaxWindow,
+    const SUnit *LastDSRead, bool LastPickWasDSRead, bool HasPickedMFMA,
+    unsigned MFMAsSinceLastDSRead, unsigned UnrelatedMFMAsSinceLastDSRead,
+    unsigned DSReadsSinceLastMFMA,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs,
+    bool EnablePrologueSetupBias) {
+  if (
+      tryFragmentWindowBalance(
+          TryCand, Cand, Zone, LiveFragments, UsefulWindow, MaxWindow,
+          LastDSRead, LastPickWasDSRead, HasPickedMFMA, MFMAsSinceLastDSRead,
+          UnrelatedMFMAsSinceLastDSRead, DSReadsSinceLastMFMA,
+          RecentDSReadUnrelatedMFMAs, EnablePrologueSetupBias))
+    return true;
+
+  return false;
+}
+
+static bool shouldKeepMFMAFragmentCandidate(
+    GenericSchedulerBase::SchedCandidate &TryCand,
+    GenericSchedulerBase::SchedCandidate &Cand, SchedBoundary &Zone,
+    unsigned LiveFragments, unsigned MaxWindow, const SUnit *LastDSRead,
+    bool LastPickWasDSRead, bool HasPickedMFMA, unsigned MFMAsSinceLastDSRead,
+    unsigned UnrelatedMFMAsSinceLastDSRead,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs) {
+  if (!TryCand.SU || !Cand.SU)
+    return false;
+
+  PipeKind TryK = classifyPipeKind(Zone, TryCand.SU);
+  PipeKind CandK = classifyPipeKind(Zone, Cand.SU);
+  bool HasDrainBacklog = false;
+
+  bool TryIsStaggeredFutureMFMA = TryK == PipeKind::FutureMFMA &&
+                                  LastPickWasDSRead && HasPickedMFMA &&
+                                  hasDSReadPred(TryCand.SU, LastDSRead);
+  bool CandIsMatureMFMA =
+      CandK == PipeKind::MatureMFMA && getIssueStall(Zone, Cand.SU) == 0;
+  if (TryIsStaggeredFutureMFMA && CandIsMatureMFMA) {
+    Cand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  auto IsDrainMFMA = [&](PipeKind Kind, SUnit *SU) {
+    if (Kind == PipeKind::MatureMFMA)
+      return getIssueStall(Zone, SU) == 0;
+    if (Kind != PipeKind::FutureMFMA)
+      return false;
+    if (getIssueStall(Zone, SU) != 0)
+      return false;
+    return getEffectiveStall(Zone, SU) <= MFMAFragmentSched.MaxDrainMFMAStall;
+  };
+
+  auto ConsumesImmatureRecentDSRead = [&](PipeKind Kind, const SUnit *SU) {
+    if (Kind != PipeKind::MatureMFMA && Kind != PipeKind::FutureMFMA)
+      return false;
+    return consumesImmatureRecentDSRead(SU, RecentDSReadUnrelatedMFMAs);
+  };
+  bool TryConsumesImmatureDSRead =
+      ConsumesImmatureRecentDSRead(TryK, TryCand.SU);
+  bool CandUnrelatedDrainMFMA = IsDrainMFMA(CandK, Cand.SU) &&
+                                !ConsumesImmatureRecentDSRead(CandK, Cand.SU);
+  bool CandUsefulSpacingProducer =
+      CandK == PipeKind::FragmentProducer && HasPickedMFMA &&
+      MFMAFragmentSched.SteadyStateMFMAs &&
+      getEffectiveStall(Zone, Cand.SU) == 0 && LiveFragments < MaxWindow &&
+      getDirectFragmentProducerScore(Cand.SU).Valid;
+  auto GetRecentDSReadSpacing = [&](PipeKind Kind, const SUnit *SU) {
+    unsigned MinSpacing = MFMAFragmentSched.SteadyStateMFMAs;
+    unsigned BestSpacing = std::numeric_limits<unsigned>::max();
+    if (Kind != PipeKind::MatureMFMA && Kind != PipeKind::FutureMFMA)
+      return MinSpacing;
+    if (!MinSpacing)
+      return MinSpacing;
+    for (const auto &DSRead : RecentDSReadUnrelatedMFMAs)
+      if (hasDSReadPred(SU, DSRead.first))
+        BestSpacing = std::min(BestSpacing, DSRead.second);
+    if (BestSpacing == std::numeric_limits<unsigned>::max())
+      return MinSpacing;
+    return BestSpacing;
+  };
+  if (HasPickedMFMA && MFMAFragmentSched.SteadyStateMFMAs &&
+      !RecentDSReadUnrelatedMFMAs.empty() && IsDrainMFMA(TryK, TryCand.SU) &&
+      IsDrainMFMA(CandK, Cand.SU) &&
+      GetRecentDSReadSpacing(CandK, Cand.SU) >
+          GetRecentDSReadSpacing(TryK, TryCand.SU)) {
+    Cand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  if (HasPickedMFMA && MFMAFragmentSched.SteadyStateMFMAs &&
+      !RecentDSReadUnrelatedMFMAs.empty() && TryConsumesImmatureDSRead &&
+      CandUnrelatedDrainMFMA) {
+    Cand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  if (HasPickedMFMA && MFMAFragmentSched.SteadyStateMFMAs &&
+      !RecentDSReadUnrelatedMFMAs.empty() && TryConsumesImmatureDSRead &&
+      CandUsefulSpacingProducer) {
+    Cand.Reason = GenericSchedulerBase::Stall;
+    return true;
+  }
+
+  bool TryIsMatureMFMA =
+      TryK == PipeKind::MatureMFMA && getIssueStall(Zone, TryCand.SU) == 0;
+  bool CandIsHideableProducer =
+      CandK == PipeKind::FragmentProducer && HasPickedMFMA &&
+      !HasDrainBacklog && !LastPickWasDSRead &&
+      MFMAsSinceLastDSRead >= MFMAFragmentSched.SteadyStateMFMAs && LiveFragments < MaxWindow &&
+      (countMFMASuccessorsUnlockedBy(Cand.SU) != 0 ||
+       countMFMASuccessorsUnlockedByAfterFiller(Cand.SU, TryCand.SU) != 0);
+  if (TryIsMatureMFMA && CandIsHideableProducer) {
+    Cand.Reason = GenericSchedulerBase::TopPathReduce;
+    return true;
+  }
+
+  if (TryK == PipeKind::FragmentProducer &&
+      CandK == PipeKind::FragmentProducer &&
+      (!HasPickedMFMA || !HasDrainBacklog)) {
+    MFMAFragmentProducerScore TryScore =
+        getReachableFragmentProducerScore(TryCand.SU);
+    MFMAFragmentProducerScore CandScore =
+        getReachableFragmentProducerScore(Cand.SU);
+    if (isBetterPrologueFragmentScore(CandScore, TryScore)) {
+      Cand.Reason = GenericSchedulerBase::TopPathReduce;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool
+tryBidirectionalReadyStall(GenericSchedulerBase::SchedCandidate &TryCand,
+                           GenericSchedulerBase::SchedCandidate &Cand,
+                           SchedBoundary &TryZone, SchedBoundary &CandZone) {
+  if (!TryCand.SU || !Cand.SU)
+    return false;
+
+  unsigned TryStall = getReadyStall(TryZone, TryCand.SU);
+  unsigned CandStall = getReadyStall(CandZone, Cand.SU);
+  if (TryStall == CandStall)
+    return false;
+
+  if (tryLess(TryStall, CandStall, TryCand, Cand, GenericSchedulerBase::Stall))
+    return TryCand.Reason != GenericSchedulerBase::NoCand;
+
+  return false;
+}
+
+static bool isTopDownBiasCandidate(SchedBoundary &Zone, SUnit *SU) {
+  PipeKind Kind = classifyPipeKind(Zone, SU);
+  if (Kind != PipeKind::FutureMFMA)
+    return Kind != PipeKind::None;
+
+  return MFMAFragmentSched.MaxFutureMFMAStall &&
+         getEffectiveStall(Zone, SU) <= MFMAFragmentSched.MaxFutureMFMAStall;
+}
+
+static bool shouldPreferTopOverBottomStalledDS(SchedBoundary &Top,
+                                               SchedBoundary &Bot,
+                                               GenericSchedulerBase::
+                                                   SchedCandidate &TopCand,
+                                               GenericSchedulerBase::
+                                                   SchedCandidate &BotCand) {
+  if (!TopCand.isValid() ||
+      !BotCand.isValid())
+    return false;
+
+  if (classifyPipeKind(Bot, BotCand.SU) != PipeKind::FragmentProducer ||
+      getReadyStall(Bot, BotCand.SU) == 0)
+    return false;
+
+  PipeKind TopKind = classifyPipeKind(Top, TopCand.SU);
+  if (TopKind == PipeKind::FragmentProducer)
+    return getReadyStall(Top, TopCand.SU) == 0;
+
+  if (TopKind != PipeKind::MatureMFMA)
+    return false;
+
+  return getReadyStall(Top, TopCand.SU) == 0;
+}
+
+static SUnit *findTopMFMAFillerForRecentDS(
+    SchedBoundary &Top, SUnit *TopSU,
+    bool HasPickedMFMA,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs,
+    bool &FillerPending) {
+  if (!TopSU || !HasPickedMFMA ||
+      classifyPipeKind(Top, TopSU) != PipeKind::FragmentProducer ||
+      !hasRecentDSReadSpacingDebt(RecentDSReadUnrelatedMFMAs))
+    return nullptr;
+
+  SUnit *Best = nullptr;
+  unsigned BestBenefit = 0;
+  unsigned BestConsumedSpacing = 0;
+  unsigned BestStall = std::numeric_limits<unsigned>::max();
+  unsigned BestReadyStall = std::numeric_limits<unsigned>::max();
+  bool BestPending = false;
+  auto TryFiller = [&](SUnit *SU, bool IsPending) {
+    if (!SU || SU->isScheduled || !isMFMALike(SU))
+      return;
+    if (getIssueStall(Top, SU) != 0)
+      return;
+
+    unsigned Benefit = 0;
+    unsigned ConsumedSpacing = MFMAFragmentSched.SteadyStateMFMAs;
+    for (const auto &DSRead : RecentDSReadUnrelatedMFMAs) {
+      if (DSRead.second >= MFMAFragmentSched.SteadyStateMFMAs)
+        continue;
+
+      if (hasDSReadPred(SU, DSRead.first)) {
+        ConsumedSpacing = std::min(ConsumedSpacing, DSRead.second);
+        continue;
+      }
+
+      Benefit += MFMAFragmentSched.SteadyStateMFMAs - DSRead.second;
+    }
+    if (!Benefit || ConsumedSpacing == 0)
+      return;
+
+    unsigned Stall = getEffectiveStall(Top, SU);
+    if (Stall > MFMAFragmentSched.MaxDrainMFMAStall)
+      return;
+
+    unsigned ReadyStall = getReadyStall(Top, SU);
+    bool Better = !Best;
+    if (!Better && Benefit != BestBenefit)
+      Better = Benefit > BestBenefit;
+    if (!Better && Benefit == BestBenefit &&
+        ConsumedSpacing != BestConsumedSpacing)
+      Better = ConsumedSpacing > BestConsumedSpacing;
+    if (!Better && Benefit == BestBenefit &&
+        ConsumedSpacing == BestConsumedSpacing && Stall != BestStall)
+      Better = Stall < BestStall;
+    if (!Better && Benefit == BestBenefit &&
+        ConsumedSpacing == BestConsumedSpacing && Stall == BestStall &&
+        ReadyStall != BestReadyStall)
+      Better = ReadyStall < BestReadyStall;
+    if (!Better && Benefit == BestBenefit &&
+        ConsumedSpacing == BestConsumedSpacing && Stall == BestStall &&
+        ReadyStall == BestReadyStall && IsPending != BestPending)
+      Better = IsPending < BestPending;
+    if (!Better && Benefit == BestBenefit &&
+        ConsumedSpacing == BestConsumedSpacing && Stall == BestStall &&
+        ReadyStall == BestReadyStall && IsPending == BestPending)
+      Better = SU->NodeNum < Best->NodeNum;
+
+    if (Better) {
+      Best = SU;
+      BestBenefit = Benefit;
+      BestConsumedSpacing = ConsumedSpacing;
+      BestStall = Stall;
+      BestReadyStall = ReadyStall;
+      BestPending = IsPending;
+    }
+  };
+
+  for (SUnit *SU : Top.Available)
+    TryFiller(SU, false);
+  for (SUnit *SU : Top.Pending)
+    TryFiller(SU, true);
+
+  if (!Best)
+    return nullptr;
+
+  FillerPending = BestPending;
+  return Best;
+}
+
+static SUnit *findTopMFMAFillerForRecentDS(
+    SchedBoundary &Top, GenericSchedulerBase::SchedCandidate &TopCand,
+    bool HasPickedMFMA,
+    const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs,
+    bool &FillerPending) {
+  if (!TopCand.isValid())
+    return nullptr;
+
+  return findTopMFMAFillerForRecentDS(
+      Top, TopCand.SU, HasPickedMFMA, RecentDSReadUnrelatedMFMAs,
+      FillerPending);
+}
+
+static SUnit *
+findBottomMFMAFillerForStalledDS(SchedBoundary &Bot,
+                                 GenericSchedulerBase::SchedCandidate &BotCand,
+                                 bool HasPickedMFMA,
+                                 DenseMap<const SUnit *, unsigned>
+                                     &DeferredDSReadFillers,
+                                 bool &FillerPending) {
+  if (!BotCand.isValid())
+    return nullptr;
+
+  if (classifyPipeKind(Bot, BotCand.SU) != PipeKind::FragmentProducer ||
+      !HasPickedMFMA || !hasScheduledMFMASuccessor(BotCand.SU))
+    return nullptr;
+
+  unsigned &DeferredFillers = DeferredDSReadFillers[BotCand.SU];
+  if (DeferredFillers >= MFMAFragmentSched.SteadyStateMFMAs)
+    return nullptr;
+
+  SUnit *Best = nullptr;
+  unsigned BestStall = std::numeric_limits<unsigned>::max();
+  unsigned BestReadyStall = std::numeric_limits<unsigned>::max();
+  bool BestPending = false;
+  auto TryFiller = [&](SUnit *SU, bool IsPending) {
+    if (!SU || SU->isScheduled || !isMFMALike(SU))
+      return;
+    if (hasDSReadPred(SU, BotCand.SU))
+      return;
+
+    unsigned Stall = getEffectiveStall(Bot, SU);
+    if (Stall > MFMAFragmentSched.MaxDrainMFMAStall)
+      return;
+
+    unsigned ReadyStall = getReadyStall(Bot, SU);
+    if (!Best || Stall < BestStall ||
+        (Stall == BestStall && ReadyStall < BestReadyStall)) {
+      Best = SU;
+      BestStall = Stall;
+      BestReadyStall = ReadyStall;
+      BestPending = IsPending;
+    }
+  };
+
+  for (SUnit *SU : Bot.Available)
+    TryFiller(SU, false);
+  for (SUnit *SU : Bot.Pending)
+    TryFiller(SU, true);
+
+  if (!Best)
+    return nullptr;
+
+  ++DeferredFillers;
+  FillerPending = BestPending;
+  return Best;
+}
+
+void GCNSchedStrategy::dumpPickDebug(SchedBoundary &Zone, SUnit *SU,
+                                     bool FromPending) const {
+  LLVM_DEBUG({
+    const FragmentWindowState &FWS =
+        Zone.isTop() ? TopFragmentWindow : BotFragmentWindow;
+    MachineInstr *MI = SU ? SU->getInstr() : nullptr;
+
+    dbgs() << "AMDGPU-SCHED-PICK " << (Zone.isTop() ? "Top" : "Bot") << ' '
+           << getQueueName(FromPending) << " SU(";
+    if (SU)
+      dbgs() << SU->NodeNum;
+    else
+      dbgs() << "<null>";
+    dbgs() << ") opcode=";
+    if (MI)
+      dbgs() << DAG->TII->getName(MI->getOpcode());
+    else
+      dbgs() << "<none>";
+    dbgs() << " TopReadyCycle=" << (SU ? SU->TopReadyCycle : 0)
+           << " BotReadyCycle=" << (SU ? SU->BotReadyCycle : 0)
+           << " CurrCycle=" << Zone.getCurrCycle()
+           << " ReadyStall=" << (SU ? getReadyStall(Zone, SU) : 0)
+           << " IssueStall=" << (SU ? getIssueStall(Zone, SU) : 0)
+           << " EffectiveStall=" << (SU ? getEffectiveStall(Zone, SU) : 0)
+           << " isUnbuffered=" << (SU ? SU->isUnbuffered : false)
+           << " hasReservedResource=" << (SU ? SU->hasReservedResource : false)
+           << " Depth=" << (SU ? SU->getDepth() : 0)
+           << " Height=" << (SU ? SU->getHeight() : 0)
+           << " Reason=" << getReasonStr(DebugLastPickReason)
+           << " DSReadLike=" << isDSReadLike(SU)
+           << " MFMALike=" << isMFMALike(SU)
+           << " PipeKind=" << getPipeKindName(classifyPipeKind(Zone, SU))
+           << " MFMAUnlocksByPick="
+           << (SU ? countMFMASuccessorsUnlockedBy(SU) : 0)
+           << " MFMABestMissingDSAfter="
+           << (SU ? getBestMFMASuccessorMissingDSReadPredsAfter(SU) : 0)
+           << " MFMABestScheduledDSAfter="
+           << (SU ? getBestMFMASuccessorScheduledDSReadPredsAfter(SU) : 0)
+           << " MFMABestSuccNode="
+           << (SU ? getBestMFMASuccessorNodeNumAfter(SU) : 0)
+           << " MFMANearUnlocksByPick="
+           << (SU ? countMFMASuccessorsWithFewMissingDSReadPredsAfter(SU, 1)
+                  : 0)
+           << " MFMAFillerCountByPick="
+           << (SU ? countDSReadSpacingFillers(Zone, SU) : 0)
+           << " MFMAUnlockDSReadPreds="
+           << (SU ? getMinUnscheduledDSReadPredsToMFMASuccessorAfter(SU) : 0)
+           << " MFMASuccReadyDist="
+           << (SU ? getMFMASuccessorReadyDistance(Zone, SU) : 0)
+           << " ReachableFragScore=";
+    if (SU)
+      dumpMFMAFragmentProducerScore(dbgs(),
+                                    getReachableFragmentProducerScore(SU));
+    else
+      dbgs() << "{}";
+    dbgs() << " LastPickWasDSRead=" << FWS.LastPickWasDSRead
+           << " HasPickedMFMA=" << FWS.HasPickedMFMA
+           << " LastDSRead=" << (FWS.LastDSRead ? FWS.LastDSRead->NodeNum : 0)
+           << " MFMAsSinceLastDSRead=" << FWS.MFMAsSinceLastDSRead
+           << " UnrelatedMFMAsSinceLastDSRead="
+           << FWS.UnrelatedMFMAsSinceLastDSRead
+           << " DSReadsSinceLastMFMA=" << FWS.DSReadsSinceLastMFMA
+           << " MFMADrainBacklog="
+           << countMFMAFragmentDrainCandidates(
+                  Zone, FWS.RecentDSReadUnrelatedMFMAs)
+           << " FragmentWindow={Live=" << FWS.LiveFragments
+           << ",MaxLive=" << FWS.MaxLiveFragments
+           << ",Useful=" << FWS.UsefulWindow << ",Max=" << FWS.MaxWindow
+           << "} RecentDSReads=[";
+    bool FirstRecentDSRead = true;
+    for (const auto &DSRead : FWS.RecentDSReadUnrelatedMFMAs) {
+      if (!FirstRecentDSRead)
+        dbgs() << ',';
+      FirstRecentDSRead = false;
+      dbgs() << DSRead.first->NodeNum << ':' << DSRead.second;
+    }
+    dbgs() << "]\n";
+
+    bool AltFromPending = false;
+    if (SUnit *Alt = findPickDebugAlt(Zone, SU, AltFromPending)) {
+      MachineInstr *AltMI = Alt->getInstr();
+      dbgs() << "AMDGPU-SCHED-BEST-ALT " << (Zone.isTop() ? "Top" : "Bot")
+             << ' ' << getQueueName(AltFromPending) << " SU(" << Alt->NodeNum
+             << ") opcode=";
+      if (AltMI)
+        dbgs() << DAG->TII->getName(AltMI->getOpcode());
+      else
+        dbgs() << "<none>";
+      dbgs() << " TopReadyCycle=" << Alt->TopReadyCycle
+             << " BotReadyCycle=" << Alt->BotReadyCycle
+             << " CurrCycle=" << Zone.getCurrCycle()
+             << " ReadyStall=" << getReadyStall(Zone, Alt)
+             << " IssueStall=" << getIssueStall(Zone, Alt)
+             << " EffectiveStall=" << getEffectiveStall(Zone, Alt)
+             << " isUnbuffered=" << Alt->isUnbuffered
+             << " hasReservedResource=" << Alt->hasReservedResource
+             << " Depth=" << Alt->getDepth() << " Height=" << Alt->getHeight()
+             << " DSReadLike=" << isDSReadLike(Alt)
+             << " MFMALike=" << isMFMALike(Alt)
+             << " PipeKind=" << getPipeKindName(classifyPipeKind(Zone, Alt))
+             << " MFMAUnlocksByPick=" << countMFMASuccessorsUnlockedBy(Alt)
+             << " MFMABestMissingDSAfter="
+             << getBestMFMASuccessorMissingDSReadPredsAfter(Alt)
+             << " MFMABestScheduledDSAfter="
+             << getBestMFMASuccessorScheduledDSReadPredsAfter(Alt)
+             << " MFMABestSuccNode=" << getBestMFMASuccessorNodeNumAfter(Alt)
+             << " MFMANearUnlocksByPick="
+             << countMFMASuccessorsWithFewMissingDSReadPredsAfter(Alt, 1)
+             << " MFMAFillerCountByPick="
+             << countDSReadSpacingFillers(Zone, Alt)
+             << " MFMAUnlockDSReadPreds="
+             << getMinUnscheduledDSReadPredsToMFMASuccessorAfter(Alt)
+             << " MFMASuccReadyDist="
+             << getMFMASuccessorReadyDistance(Zone, Alt)
+             << " ReachableFragScore=";
+      dumpMFMAFragmentProducerScore(dbgs(),
+                                    getReachableFragmentProducerScore(Alt));
+      dbgs() << "\n";
+    }
+  });
+}
+
+void GCNSchedStrategy::updatePickDebugStats(SchedBoundary &Zone, SUnit *SU) {
+  unsigned ReadyStall = getReadyStall(Zone, SU);
+  ++DebugStats.NumPicks;
+  DebugStats.TotalPickedReadyStall += ReadyStall;
+  DebugStats.MaxPickedReadyStall =
+      std::max(DebugStats.MaxPickedReadyStall, ReadyStall);
+
+  if (ReadyStall)
+    ++DebugStats.NumFutureReadyPicks;
+  if (isDSReadLike(SU)) {
+    ++DebugStats.NumDSReadPicks;
+    const FragmentWindowState &FWS =
+        Zone.isTop() ? TopFragmentWindow : BotFragmentWindow;
+    if (FWS.LiveFragments >= FWS.MaxWindow)
+      ++DebugStats.NumOverMaxDSReadPicks;
+  }
+  if (isMFMALike(SU)) {
+    if (ReadyStall) {
+      ++DebugStats.NumFutureReadyMFMAPicks;
+      ++DebugStats.NumFutureMFMAPicks;
+      if (hasUsefulReadyAlt(Zone, SU))
+        ++DebugStats.NumAvoidableFutureReadyMFMAPicks;
+      if (hasUsefulPipeAlt(Zone, SU))
+        ++DebugStats.NumAvoidableFutureReadyMFMAPicksWithPipeAlt;
+    } else if (isMatureMFMA(Zone, SU)) {
+      ++DebugStats.NumMatureMFMAPicks;
+    }
+  }
+}
+
+void GCNSchedStrategy::updateFragmentWindow(SUnit *SU, bool IsTopNode) {
+  FragmentWindowState &FWS = IsTopNode ? TopFragmentWindow : BotFragmentWindow;
+  SchedBoundary &Zone = IsTopNode ? Top : Bot;
+  if (isDSReadLike(SU)) {
+    FWS.DeferredDSReadFillers.erase(SU);
+    ++FWS.LiveFragments;
+    FWS.MaxLiveFragments = std::max(FWS.MaxLiveFragments, FWS.LiveFragments);
+    if (FWS.HasPickedMFMA)
+      ++FWS.DSReadsSinceLastMFMA;
+    FWS.LastDSRead = SU;
+    FWS.MFMAsSinceLastDSRead = 0;
+    FWS.UnrelatedMFMAsSinceLastDSRead = 0;
+    FWS.RecentDSReadUnrelatedMFMAs[SU] = 0;
+    FWS.LastPickWasDSRead = true;
+    return;
+  }
+
+  FWS.LastPickWasDSRead = false;
+
+  if (isMFMALike(SU)) {
+    bool IsUsefulFiller = getReadyStall(Zone, SU) == 0 &&
+                          getIssueStall(Zone, SU) == 0;
+    FWS.HasPickedMFMA = true;
+    FWS.DSReadsSinceLastMFMA = 0;
+    if (IsUsefulFiller)
+      ++FWS.MFMAsSinceLastDSRead;
+    if (IsUsefulFiller && !hasDSReadPred(SU, FWS.LastDSRead))
+      ++FWS.UnrelatedMFMAsSinceLastDSRead;
+    if (MFMAFragmentSched.SteadyStateMFMAs) {
+      SmallVector<const SUnit *, 8> MatureDSReads;
+      for (auto &DSRead : FWS.RecentDSReadUnrelatedMFMAs) {
+        if (hasDSReadPred(SU, DSRead.first)) {
+          MatureDSReads.push_back(DSRead.first);
+          continue;
+        }
+        if (IsUsefulFiller) {
+          ++DSRead.second;
+          if (MFMAFragmentSched.SteadyStateMFMAs &&
+              DSRead.second > MFMAFragmentSched.SteadyStateMFMAs)
+            MatureDSReads.push_back(DSRead.first);
+        }
+      }
+      for (const SUnit *DSRead : MatureDSReads)
+        FWS.RecentDSReadUnrelatedMFMAs.erase(DSRead);
+    }
+    if (FWS.LiveFragments)
+      --FWS.LiveFragments;
+  }
+}
+
+void GCNSchedStrategy::resetFragmentWindows() {
+  TopFragmentWindow = FragmentWindowState();
+  BotFragmentWindow = FragmentWindowState();
+
+  unsigned UsefulWindow = MFMAFragmentSched.WindowSize;
+  unsigned MaxWindow = UsefulWindow;
+  TopFragmentWindow.UsefulWindow = UsefulWindow;
+  BotFragmentWindow.UsefulWindow = UsefulWindow;
+  TopFragmentWindow.MaxWindow = MaxWindow;
+  BotFragmentWindow.MaxWindow = MaxWindow;
+}
+
+void GCNSchedStrategy::dumpPickDebugSummary() {
+  LLVM_DEBUG({
+    if (!DebugStats.NumPicks) {
+      resetFragmentWindows();
+      return;
+    }
+    dbgs() << "AMDGPU-SCHED-SUMMARY"
+           << " Picks=" << DebugStats.NumPicks
+           << " FutureReadyPicks=" << DebugStats.NumFutureReadyPicks
+           << " FutureReadyMFMAPicks=" << DebugStats.NumFutureReadyMFMAPicks
+           << " AvoidableFutureReadyMFMAPicks="
+           << DebugStats.NumAvoidableFutureReadyMFMAPicks
+           << " AvoidableFutureReadyMFMAPicksWithPipeAlt="
+           << DebugStats.NumAvoidableFutureReadyMFMAPicksWithPipeAlt
+           << " DSReadPicks=" << DebugStats.NumDSReadPicks
+           << " OverMaxDSReadPicks=" << DebugStats.NumOverMaxDSReadPicks
+           << " MatureMFMAPicks=" << DebugStats.NumMatureMFMAPicks
+           << " FutureMFMAPicks=" << DebugStats.NumFutureMFMAPicks
+           << " TotalPickedReadyStall=" << DebugStats.TotalPickedReadyStall
+           << " MaxPickedReadyStall=" << DebugStats.MaxPickedReadyStall
+           << " AvgPickedReadyStall="
+           << (DebugStats.TotalPickedReadyStall / DebugStats.NumPicks)
+           << " AvgPickedReadyStallX100="
+           << ((DebugStats.TotalPickedReadyStall * 100) / DebugStats.NumPicks)
+           << " TopFragmentWindowLive=" << TopFragmentWindow.LiveFragments
+           << " BotFragmentWindowLive=" << BotFragmentWindow.LiveFragments
+           << " TopFragmentWindowMaxLive=" << TopFragmentWindow.MaxLiveFragments
+           << " BotFragmentWindowMaxLive=" << BotFragmentWindow.MaxLiveFragments
+           << "\n";
+
+    DebugStats = PickDebugStats();
+    resetFragmentWindows();
+  });
+}
+
+bool GCNSchedStrategy::tryCandidate(SchedCandidate &Cand,
+                                    SchedCandidate &TryCand,
+                                    SchedBoundary *Zone) const {
+  if (!EnableMFMAFragmentScheduler)
+    return GenericScheduler::tryCandidate(Cand, TryCand, Zone);
+
+  if (!Cand.isValid()) {
+    TryCand.Reason = FirstValid;
+    return true;
+  }
+
+  if (tryGreater(biasPhysReg(TryCand.SU, TryCand.AtTop),
+                 biasPhysReg(Cand.SU, Cand.AtTop), TryCand, Cand, PhysReg))
+    return TryCand.Reason != NoCand;
+
+  if (DAG->isTrackingPressure() &&
+      tryPressure(TryCand.RPDelta.Excess, Cand.RPDelta.Excess, TryCand, Cand,
+                  RegExcess, TRI, DAG->MF))
+    return TryCand.Reason != NoCand;
+
+  if (DAG->isTrackingPressure() &&
+      tryPressure(TryCand.RPDelta.CriticalMax, Cand.RPDelta.CriticalMax,
+                  TryCand, Cand, RegCritical, TRI, DAG->MF))
+    return TryCand.Reason != NoCand;
+
+  bool SameBoundary = Zone != nullptr;
+  if (SameBoundary) {
+    const FragmentWindowState &FWS =
+        Zone->isTop() ? TopFragmentWindow : BotFragmentWindow;
+    if (tryRecentDSReadSpacing(TryCand, Cand, *Zone, FWS.HasPickedMFMA,
+                               FWS.RecentDSReadUnrelatedMFMAs))
+      return TryCand.Reason != NoCand;
+
+    if (shouldKeepMFMAFragmentCandidate(
+            TryCand, Cand, *Zone, FWS.LiveFragments, FWS.MaxWindow,
+            FWS.LastDSRead, FWS.LastPickWasDSRead, FWS.HasPickedMFMA,
+            FWS.MFMAsSinceLastDSRead, FWS.UnrelatedMFMAsSinceLastDSRead,
+            FWS.RecentDSReadUnrelatedMFMAs))
+      return false;
+
+    if (tryMFMAFragmentHeuristic(TryCand, Cand, *Zone, FWS.LiveFragments,
+                                 FWS.UsefulWindow, FWS.MaxWindow,
+                                 FWS.LastDSRead, FWS.LastPickWasDSRead,
+                                 FWS.HasPickedMFMA, FWS.MFMAsSinceLastDSRead,
+                                 FWS.UnrelatedMFMAsSinceLastDSRead,
+                                 FWS.DSReadsSinceLastMFMA,
+                                 FWS.RecentDSReadUnrelatedMFMAs, true))
+      return TryCand.Reason != NoCand;
+
+    if (Rem.IsAcyclicLatencyLimited && !Zone->getCurrMOps() &&
+        tryLatency(TryCand, Cand, *Zone))
+      return TryCand.Reason != NoCand;
+
+    if (tryLess(Zone->getLatencyStallCycles(TryCand.SU),
+                Zone->getLatencyStallCycles(Cand.SU), TryCand, Cand, Stall))
+      return TryCand.Reason != NoCand;
+  }
+
+  unsigned CandZoneCluster = Cand.AtTop ? TopClusterID : BotClusterID;
+  unsigned TryCandZoneCluster = TryCand.AtTop ? TopClusterID : BotClusterID;
+  bool CandIsClusterSucc =
+      isTheSameCluster(CandZoneCluster, Cand.SU->ParentClusterIdx);
+  bool TryCandIsClusterSucc =
+      isTheSameCluster(TryCandZoneCluster, TryCand.SU->ParentClusterIdx);
+
+  if (tryGreater(TryCandIsClusterSucc, CandIsClusterSucc, TryCand, Cand,
+                 Cluster))
+    return TryCand.Reason != NoCand;
+
+  if (SameBoundary) {
+    if (tryLess(getWeakLeft(TryCand.SU, TryCand.AtTop),
+                getWeakLeft(Cand.SU, Cand.AtTop), TryCand, Cand, Weak))
+      return TryCand.Reason != NoCand;
+  }
+
+  if (DAG->isTrackingPressure() &&
+      tryPressure(TryCand.RPDelta.CurrentMax, Cand.RPDelta.CurrentMax, TryCand,
+                  Cand, RegMax, TRI, DAG->MF))
+    return TryCand.Reason != NoCand;
+
+  if (SameBoundary) {
+    TryCand.initResourceDelta(DAG, SchedModel);
+    if (tryLess(TryCand.ResDelta.CritResources, Cand.ResDelta.CritResources,
+                TryCand, Cand, ResourceReduce))
+      return TryCand.Reason != NoCand;
+    if (tryGreater(TryCand.ResDelta.DemandedResources,
+                   Cand.ResDelta.DemandedResources, TryCand, Cand,
+                   ResourceDemand))
+      return TryCand.Reason != NoCand;
+
+    if (!RegionPolicy.DisableLatencyHeuristic && TryCand.Policy.ReduceLatency &&
+        !Rem.IsAcyclicLatencyLimited && tryLatency(TryCand, Cand, *Zone))
+      return TryCand.Reason != NoCand;
+
+    if ((Zone->isTop() && TryCand.SU->NodeNum < Cand.SU->NodeNum) ||
+        (!Zone->isTop() && TryCand.SU->NodeNum > Cand.SU->NodeNum)) {
+      TryCand.Reason = NodeOrder;
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void GCNSchedStrategy::printCandidateDecision(const SchedCandidate &Current,
                                               const SchedCandidate &Preferred) {
   LLVM_DEBUG({
@@ -432,6 +2638,29 @@ void GCNSchedStrategy::pickNodeFromQueue(SchedBoundary &Zone,
     }
   }
 
+  if (EnableMFMAFragmentScheduler) {
+    const FragmentWindowState &FWS =
+        Zone.isTop() ? TopFragmentWindow : BotFragmentWindow;
+    if (SUnit *PullForwardProducer = findPullForwardUnlockingProducer(
+            Zone, Cand, FWS.LiveFragments, FWS.UsefulWindow,
+            FWS.LastPickWasDSRead, FWS.HasPickedMFMA,
+            FWS.RecentDSReadUnrelatedMFMAs)) {
+      Cand.reset(ZonePolicy);
+      Cand.SU = PullForwardProducer;
+      Cand.AtTop = Zone.isTop();
+      Cand.Reason = TopPathReduce;
+      return;
+    }
+
+    if (shouldKeepAvailableUnlockingProducer(
+            Zone, Cand.SU, FWS.LiveFragments, FWS.MaxWindow,
+            FWS.LastPickWasDSRead, FWS.HasPickedMFMA,
+            FWS.MFMAsSinceLastDSRead, FWS.RecentDSReadUnrelatedMFMAs)) {
+      Cand.Reason = TopPathReduce;
+      return;
+    }
+  }
+
   if (!shouldCheckPending(Zone, SchedModel))
     return;
 
@@ -466,10 +2695,12 @@ SUnit *GCNSchedStrategy::pickNodeBidirectional(bool &IsTopNode,
   // efficient, but also provides the best heuristics for CriticalPSets.
   if (SUnit *SU = pickOnlyChoice(Bot, SchedModel)) {
     IsTopNode = false;
+    DebugLastPickReason = Only1;
     return SU;
   }
   if (SUnit *SU = pickOnlyChoice(Top, SchedModel)) {
     IsTopNode = true;
+    DebugLastPickReason = Only1;
     return SU;
   }
   // Set the bottom-up policy based on the state of the current bottom zone
@@ -539,7 +2770,90 @@ SUnit *GCNSchedStrategy::pickNodeBidirectional(bool &IsTopNode,
   PickedPending = BotPending && TopPending;
 
   TryCand.Reason = NoCand;
-  if (BotPending || TopPending) {
+  unsigned TopEffectiveUsefulWindow =
+      TopFragmentWindow.HasPickedMFMA
+          ? TopFragmentWindow.UsefulWindow
+          : std::min(TopFragmentWindow.UsefulWindow,
+                     MFMAFragmentSched.PrologueWindow);
+  bool BiasActiveFragmentWindowTopDown =
+      EnableMFMAFragmentScheduler &&
+      (!TopFragmentWindow.HasPickedMFMA
+          ? TopFragmentWindow.LiveFragments >= TopEffectiveUsefulWindow
+          : TopFragmentWindow.LiveFragments >= TopEffectiveUsefulWindow ||
+                !TopFragmentWindow.RecentDSReadUnrelatedMFMAs.empty() ||
+                TopFragmentWindow.MFMAsSinceLastDSRead <
+                    MFMAFragmentSched.SteadyStateMFMAs);
+  bool IsFirstFragmentMFMA =
+      !TopFragmentWindow.HasPickedMFMA && isMFMALike(TopCand.SU);
+  bool IsOverfullTopFragmentProducer =
+      TopFragmentWindow.HasPickedMFMA && TopCand.isValid() &&
+      classifyPipeKind(Top, TopCand.SU) == PipeKind::FragmentProducer &&
+      TopFragmentWindow.LiveFragments >= TopEffectiveUsefulWindow;
+  bool BottomFillerPending = false;
+  bool TopFillerPending = false;
+  bool TopCandIsFragmentProducer =
+      TopCand.isValid() &&
+      classifyPipeKind(Top, TopCand.SU) == PipeKind::FragmentProducer;
+  bool TopCandIsPullForwardProducer =
+      TopCandIsFragmentProducer &&
+      isPullForwardUnlockingProducer(
+          Top, TopCand.SU, TopFragmentWindow.LiveFragments,
+          TopFragmentWindow.UsefulWindow, TopFragmentWindow.LastPickWasDSRead,
+          TopFragmentWindow.HasPickedMFMA, /*AllowFullWindow=*/true,
+          TopFragmentWindow.RecentDSReadUnrelatedMFMAs);
+  SUnit *TopFiller =
+      !EnableMFMAFragmentScheduler || TopCandIsPullForwardProducer
+          ? nullptr
+          : findTopMFMAFillerForRecentDS(
+                Top, TopCand, TopFragmentWindow.HasPickedMFMA,
+                TopFragmentWindow.RecentDSReadUnrelatedMFMAs,
+                TopFillerPending);
+  SUnit *BottomFiller =
+      !EnableMFMAFragmentScheduler || TopCandIsFragmentProducer
+          ? nullptr
+          : findBottomMFMAFillerForStalledDS(
+                Bot, BotCand, BotFragmentWindow.HasPickedMFMA,
+                BotFragmentWindow.DeferredDSReadFillers, BottomFillerPending);
+  if (TopFiller) {
+    Cand.reset(TopPolicy);
+    Cand.SU = TopFiller;
+    Cand.AtTop = true;
+    Cand.Reason = Stall;
+    PickedPending = TopFillerPending;
+  } else if (EnableMFMAFragmentScheduler &&
+             shouldPreferBoundaryForRecentDSReadSpacing(
+                 Top, TopCand, BotCand,
+                 TopFragmentWindow.RecentDSReadUnrelatedMFMAs)) {
+    Cand.setBest(TopCand);
+    PickedPending = TopPending;
+  } else if (EnableMFMAFragmentScheduler &&
+             shouldPreferBoundaryForRecentDSReadSpacing(
+                 Bot, BotCand, TopCand,
+                 BotFragmentWindow.RecentDSReadUnrelatedMFMAs)) {
+    Cand.setBest(BotCand);
+    PickedPending = BotPending;
+  } else if (BottomFiller) {
+    Cand.reset(BotPolicy);
+    Cand.SU = BottomFiller;
+    Cand.AtTop = false;
+    Cand.Reason = Stall;
+    PickedPending = BottomFillerPending;
+  } else if (BiasActiveFragmentWindowTopDown && TopCand.isValid() &&
+      !IsOverfullTopFragmentProducer &&
+      (IsFirstFragmentMFMA || isTopDownBiasCandidate(Top, TopCand.SU))) {
+    Cand.setBest(TopCand);
+    PickedPending = TopPending;
+  } else if (EnableMFMAFragmentScheduler &&
+             shouldPreferTopOverBottomStalledDS(Top, Bot, TopCand, BotCand)) {
+    Cand.setBest(TopCand);
+    PickedPending = TopPending;
+  } else if (EnableMFMAFragmentScheduler &&
+             tryBidirectionalReadyStall(TryCand, Cand,
+                                        TryCand.AtTop ? Top : Bot,
+                                        Cand.AtTop ? Top : Bot)) {
+    Cand.setBest(TryCand);
+    PickedPending = Cand.AtTop ? TopPending : BotPending;
+  } else if (BotPending || TopPending) {
     PickedPending |= tryPendingCandidate(Cand, TopCand, nullptr);
   } else {
     tryCandidate(Cand, TryCand, nullptr);
@@ -552,6 +2866,7 @@ SUnit *GCNSchedStrategy::pickNodeBidirectional(bool &IsTopNode,
   LLVM_DEBUG(dbgs() << "Picking: "; traceCandidate(Cand););
 
   IsTopNode = Cand.AtTop;
+  DebugLastPickReason = Cand.Reason;
   return Cand.SU;
 }
 
@@ -561,6 +2876,7 @@ SUnit *GCNSchedStrategy::pickNode(bool &IsTopNode) {
   if (DAG->top() == DAG->bottom()) {
     assert(Top.Available.empty() && Top.Pending.empty() &&
            Bot.Available.empty() && Bot.Pending.empty() && "ReadyQ garbage");
+    dumpPickDebugSummary();
     return nullptr;
   }
   bool PickedPending;
@@ -577,6 +2893,20 @@ SUnit *GCNSchedStrategy::pickNode(bool &IsTopNode) {
                           /*IsBottomUp=*/false);
         assert(TopCand.Reason != NoCand && "failed to find a candidate");
         SU = TopCand.SU;
+        DebugLastPickReason = TopCand.Reason;
+      } else {
+        DebugLastPickReason = Only1;
+      }
+      if (EnableMFMAFragmentScheduler) {
+        bool TopFillerPending = false;
+        if (SUnit *TopFiller = findTopMFMAFillerForRecentDS(
+                Top, SU, TopFragmentWindow.HasPickedMFMA,
+                TopFragmentWindow.RecentDSReadUnrelatedMFMAs,
+                TopFillerPending)) {
+          SU = TopFiller;
+          PickedPending = TopFillerPending;
+          DebugLastPickReason = Stall;
+        }
       }
       IsTopNode = true;
     } else if (RegionPolicy.OnlyBottomUp) {
@@ -589,12 +2919,19 @@ SUnit *GCNSchedStrategy::pickNode(bool &IsTopNode) {
                           /*IsBottomUp=*/true);
         assert(BotCand.Reason != NoCand && "failed to find a candidate");
         SU = BotCand.SU;
+        DebugLastPickReason = BotCand.Reason;
+      } else {
+        DebugLastPickReason = Only1;
       }
       IsTopNode = false;
     } else {
       SU = pickNodeBidirectional(IsTopNode, PickedPending);
     }
   } while (SU->isScheduled);
+
+  SchedBoundary &PickedZone = IsTopNode ? Top : Bot;
+  dumpPickDebug(PickedZone, SU, PickedPending);
+  updatePickDebugStats(PickedZone, SU);
 
   if (PickedPending) {
     unsigned ReadyCycle = IsTopNode ? SU->TopReadyCycle : SU->BotReadyCycle;
@@ -623,6 +2960,9 @@ SUnit *GCNSchedStrategy::pickNode(bool &IsTopNode) {
 }
 
 void GCNSchedStrategy::schedNode(SUnit *SU, bool IsTopNode) {
+  if (EnableMFMAFragmentScheduler)
+    updateFragmentWindow(SU, IsTopNode);
+
   if (GCNTrackers) {
     MachineInstr *MI = SU->getInstr();
     IsTopNode ? (void)DownwardTracker.advance(MI, false)
@@ -685,6 +3025,30 @@ bool GCNSchedStrategy::tryPendingCandidate(SchedCandidate &Cand,
 
   bool SameBoundary = Zone != nullptr;
   if (SameBoundary) {
+    const FragmentWindowState &FWS =
+        Zone->isTop() ? TopFragmentWindow : BotFragmentWindow;
+    if (EnableMFMAFragmentScheduler &&
+        tryRecentDSReadSpacing(TryCand, Cand, *Zone, FWS.HasPickedMFMA,
+                               FWS.RecentDSReadUnrelatedMFMAs))
+      return TryCand.Reason != NoCand;
+
+    if (EnableMFMAFragmentScheduler && shouldKeepMFMAFragmentCandidate(
+            TryCand, Cand, *Zone, FWS.LiveFragments, FWS.MaxWindow,
+            FWS.LastDSRead, FWS.LastPickWasDSRead, FWS.HasPickedMFMA,
+            FWS.MFMAsSinceLastDSRead, FWS.UnrelatedMFMAsSinceLastDSRead,
+            FWS.RecentDSReadUnrelatedMFMAs))
+      return false;
+
+    if (EnableMFMAFragmentScheduler &&
+        tryMFMAFragmentHeuristic(TryCand, Cand, *Zone, FWS.LiveFragments,
+                                 FWS.UsefulWindow, FWS.MaxWindow,
+                                 FWS.LastDSRead, FWS.LastPickWasDSRead,
+                                 FWS.HasPickedMFMA, FWS.MFMAsSinceLastDSRead,
+                                 FWS.UnrelatedMFMAsSinceLastDSRead,
+                                 FWS.DSReadsSinceLastMFMA,
+                                 FWS.RecentDSReadUnrelatedMFMAs, true))
+      return TryCand.Reason != NoCand;
+
     TryCand.initResourceDelta(DAG, SchedModel);
     if (tryLess(TryCand.ResDelta.CritResources, Cand.ResDelta.CritResources,
                 TryCand, Cand, ResourceReduce))
@@ -737,6 +3101,25 @@ bool GCNMaxILPSchedStrategy::tryCandidate(SchedCandidate &Cand,
 
   bool SameBoundary = Zone != nullptr;
   if (SameBoundary) {
+    const FragmentWindowState &FWS =
+        Zone->isTop() ? TopFragmentWindow : BotFragmentWindow;
+    if (EnableMFMAFragmentScheduler && shouldKeepMFMAFragmentCandidate(
+            TryCand, Cand, *Zone, FWS.LiveFragments, FWS.MaxWindow,
+            FWS.LastDSRead, FWS.LastPickWasDSRead, FWS.HasPickedMFMA,
+            FWS.MFMAsSinceLastDSRead, FWS.UnrelatedMFMAsSinceLastDSRead,
+            FWS.RecentDSReadUnrelatedMFMAs))
+      return false;
+
+    if (EnableMFMAFragmentScheduler &&
+        tryMFMAFragmentHeuristic(TryCand, Cand, *Zone, FWS.LiveFragments,
+                                 FWS.UsefulWindow, FWS.MaxWindow,
+                                 FWS.LastDSRead, FWS.LastPickWasDSRead,
+                                 FWS.HasPickedMFMA, FWS.MFMAsSinceLastDSRead,
+                                 FWS.UnrelatedMFMAsSinceLastDSRead,
+                                 FWS.DSReadsSinceLastMFMA,
+                                 FWS.RecentDSReadUnrelatedMFMAs, true))
+      return TryCand.Reason != NoCand;
+
     // Prioritize instructions that read unbuffered resources by stall cycles.
     if (tryLess(Zone->getLatencyStallCycles(TryCand.SU),
                 Zone->getLatencyStallCycles(Cand.SU), TryCand, Cand, Stall))
@@ -3187,6 +5570,8 @@ void GCNPostScheduleDAGMILive::schedule() {
     SavedMutations.clear();
     SavedMutations.swap(Mutations);
     addMutation(createIGroupLPDAGMutation(AMDGPU::SchedulingPhase::PostRA));
+    if (EnableMFMAFragmentScheduler)
+      addMutation(createPostRASchedOrderDAGMutation());
   }
 
   ScheduleDAGMI::schedule();

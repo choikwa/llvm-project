@@ -12,12 +12,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "GCNSubtarget.h"
+#include "AMDGPU.h"
 #include "AMDGPUCallLowering.h"
 #include "AMDGPUInstructionSelector.h"
 #include "AMDGPULegalizerInfo.h"
 #include "AMDGPURegisterBankInfo.h"
 #include "AMDGPUSelectionDAGInfo.h"
 #include "AMDGPUTargetMachine.h"
+#include "SIInstrInfo.h"
 #include "SIMachineFunctionInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/SmallString.h"
@@ -51,6 +53,42 @@ static cl::opt<unsigned>
     NSAThreshold("amdgpu-nsa-threshold",
                  cl::desc("Number of addresses from which to enable MIMG NSA."),
                  cl::init(2), cl::Hidden);
+
+template <typename PredicateT>
+static bool hasBundledMI(const MachineInstr &MI, PredicateT Pred) {
+  if (Pred(MI))
+    return true;
+
+  if (MI.getOpcode() != TargetOpcode::BUNDLE)
+    return false;
+
+  MachineBasicBlock::const_instr_iterator It = MI.getIterator();
+  for (++It; It != MI.getParent()->instr_end() && It->isBundledWithPred();
+       ++It) {
+    if (Pred(*It))
+      return true;
+  }
+
+  return false;
+}
+
+static bool isPostRADSReadFragmentProducer(const MachineInstr &MI) {
+  return hasBundledMI(MI, [](const MachineInstr &BundledMI) {
+    switch (BundledMI.getOpcode()) {
+    case AMDGPU::DS_READ_B128:
+    case AMDGPU::DS_READ_B128_gfx9:
+      return true;
+    default:
+      return false;
+    }
+  });
+}
+
+static bool isPostRAMFMAFragmentConsumer(const MachineInstr &MI) {
+  return hasBundledMI(MI, [](const MachineInstr &BundledMI) {
+    return SIInstrInfo::isMFMA(BundledMI);
+  });
+}
 
 GCNSubtarget::~GCNSubtarget() = default;
 
@@ -371,6 +409,18 @@ void GCNSubtarget::overridePostRASchedPolicy(MachineSchedPolicy &Policy,
     dbgs() << "Post-MI-sched direction (" << F.getName() << "): " << DirStr
            << '\n';
   });
+}
+
+bool GCNSubtarget::shouldPreservePostRASchedOrder(const SUnit &SU) const {
+  if (!isMFMAFragmentSchedulerEnabled())
+    return false;
+
+  const MachineInstr *MI = SU.getInstr();
+  if (!MI)
+    return false;
+
+  return isPostRADSReadFragmentProducer(*MI) ||
+         isPostRAMFMAFragmentConsumer(*MI);
 }
 
 void GCNSubtarget::mirFileLoaded(MachineFunction &MF) const {

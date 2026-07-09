@@ -1957,6 +1957,106 @@ void ScheduleDAGMILive::scheduleMI(SUnit *SU, bool IsTopNode) {
 }
 
 //===----------------------------------------------------------------------===//
+// PostRASchedOrderMutation - Preserve target-selected postRA order.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+class PostRASchedOrderMutation : public ScheduleDAGMutation {
+  static bool hasPreservedDataPred(const TargetSubtargetInfo &ST,
+                                   const SUnit &SU) {
+    for (const SDep &Pred : SU.Preds) {
+      if (Pred.getKind() != SDep::Data)
+        continue;
+
+      const SUnit *PredSU = Pred.getSUnit();
+      if (PredSU && ST.shouldPreservePostRASchedOrder(*PredSU))
+        return true;
+    }
+
+    return false;
+  }
+
+  static unsigned getBestPreservedDataSuccNode(const TargetSubtargetInfo &ST,
+                                               const SUnit &SU) {
+    unsigned BestSuccNode = std::numeric_limits<unsigned>::max();
+    for (const SDep &Succ : SU.Succs) {
+      if (Succ.getKind() != SDep::Data)
+        continue;
+
+      const SUnit *SuccSU = Succ.getSUnit();
+      if (SuccSU && ST.shouldPreservePostRASchedOrder(*SuccSU))
+        BestSuccNode = std::min(BestSuccNode, SuccSU->NodeNum);
+    }
+
+    return BestSuccNode;
+  }
+
+  static bool isPreservedProducer(const TargetSubtargetInfo &ST,
+                                  const SUnit &SU) {
+    return getBestPreservedDataSuccNode(ST, SU) !=
+               std::numeric_limits<unsigned>::max() &&
+           !hasPreservedDataPred(ST, SU);
+  }
+
+public:
+  void apply(ScheduleDAGInstrs *DAG) override {
+    const TargetSubtargetInfo &ST = DAG->MF.getSubtarget();
+    SmallVector<SUnit *, 16> OrderedSUs;
+    SmallVector<SUnit *, 8> ProducerRun;
+
+    auto FlushProducerRun = [&]() {
+      llvm::stable_sort(ProducerRun, [&ST](const SUnit *LHS,
+                                           const SUnit *RHS) {
+        unsigned LHSBestSucc = getBestPreservedDataSuccNode(ST, *LHS);
+        unsigned RHSBestSucc = getBestPreservedDataSuccNode(ST, *RHS);
+        if (LHSBestSucc != RHSBestSucc)
+          return LHSBestSucc < RHSBestSucc;
+        return LHS->NodeNum < RHS->NodeNum;
+      });
+
+      OrderedSUs.append(ProducerRun.begin(), ProducerRun.end());
+      ProducerRun.clear();
+    };
+
+    for (SUnit &SU : DAG->SUnits) {
+      if (!ST.shouldPreservePostRASchedOrder(SU))
+        continue;
+
+      if (isPreservedProducer(ST, SU)) {
+        ProducerRun.push_back(&SU);
+        continue;
+      }
+
+      FlushProducerRun();
+      OrderedSUs.push_back(&SU);
+    }
+
+    FlushProducerRun();
+
+    SUnit *PrevSU = nullptr;
+
+    for (SUnit *SU : OrderedSUs) {
+      if (PrevSU) {
+        if (DAG->addEdge(SU, SDep(PrevSU, SDep::Artificial)))
+          LLVM_DEBUG(dbgs() << "Preserving postRA schedule order in "
+                            << DAG->MF.getName() << ": SU(" << PrevSU->NodeNum
+                            << ") -> SU(" << SU->NodeNum << ")\n");
+      }
+
+      PrevSU = SU;
+    }
+  }
+};
+
+} // end anonymous namespace
+
+std::unique_ptr<ScheduleDAGMutation>
+llvm::createPostRASchedOrderDAGMutation() {
+  return std::make_unique<PostRASchedOrderMutation>();
+}
+
+//===----------------------------------------------------------------------===//
 // BaseMemOpClusterMutation - DAG post-processing to cluster loads or stores.
 //===----------------------------------------------------------------------===//
 

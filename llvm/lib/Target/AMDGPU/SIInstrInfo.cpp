@@ -563,6 +563,16 @@ static bool memOpsHaveSameBasePtr(const MachineInstr &MI1,
   return Base1 == Base2;
 }
 
+static bool isDSReadB128Like(const MachineInstr &MI) {
+  switch (MI.getOpcode()) {
+  case AMDGPU::DS_READ_B128:
+  case AMDGPU::DS_READ_B128_gfx9:
+    return true;
+  default:
+    return false;
+  }
+}
+
 bool SIInstrInfo::shouldClusterMemOps(ArrayRef<const MachineOperand *> BaseOps1,
                                       int64_t Offset1, bool OffsetIsScalable1,
                                       ArrayRef<const MachineOperand *> BaseOps2,
@@ -575,6 +585,10 @@ bool SIInstrInfo::shouldClusterMemOps(ArrayRef<const MachineOperand *> BaseOps1,
   if (!BaseOps1.empty() && !BaseOps2.empty()) {
     const MachineInstr &FirstLdSt = *BaseOps1.front()->getParent();
     const MachineInstr &SecondLdSt = *BaseOps2.front()->getParent();
+    if (isMFMAFragmentSchedulerEnabled() && isDSReadB128Like(FirstLdSt) &&
+        isDSReadB128Like(SecondLdSt))
+      return false;
+
     if (!memOpsHaveSameBasePtr(FirstLdSt, BaseOps1, SecondLdSt, BaseOps2))
       return false;
 
