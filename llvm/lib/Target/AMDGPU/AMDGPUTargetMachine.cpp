@@ -1405,6 +1405,8 @@ GCNTargetMachine::createPostMachineScheduler(MachineSchedContext *C) const {
   DAG->addMutation(createAMDGPUExportClusteringDAGMutation());
   DAG->addMutation(createAMDGPUBarrierLatencyDAGMutation(C->MF));
   DAG->addMutation(createAMDGPUHazardLatencyDAGMutation(C->MF));
+  if (isMFMAFragmentSchedulerEnabled(ST))
+    DAG->addMutation(createMFMAFragmentPostRASchedOrderDAGMutation());
   return DAG;
 }
 //===----------------------------------------------------------------------===//
