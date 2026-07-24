@@ -89,7 +89,8 @@ static bool isPostRADSReadFragmentProducer(const MachineInstr &MI) {
 
 static bool isPostRAMFMAFragmentConsumer(const MachineInstr &MI) {
   return hasBundledMI(MI, [](const MachineInstr &BundledMI) {
-    return SIInstrInfo::isMFMA(BundledMI);
+    return BundledMI.getOpcode() ==
+           AMDGPU::V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64;
   });
 }
 
@@ -100,6 +101,43 @@ static bool isMFMAFragmentPipelineInstr(const SUnit &SU) {
 }
 
 namespace {
+
+class MFMAFragmentPreRASchedMutation : public ScheduleDAGMutation {
+  const GCNSubtarget &ST;
+
+public:
+  MFMAFragmentPreRASchedMutation(MachineFunction *MF)
+      : ST(MF->getSubtarget<GCNSubtarget>()) {}
+
+  void apply(ScheduleDAGInstrs *DAG) override {
+    if (!isMFMAFragmentSchedulerEnabled(ST))
+      return;
+
+    for (SUnit &SU : DAG->SUnits) {
+      MachineInstr *MI = SU.getInstr();
+      if (!MI || !SIInstrInfo::isMFMA(*MI))
+        continue;
+
+      SmallVector<SDep, 4> ClusterCopies;
+      for (const SDep &PredDep : SU.Preds) {
+        if (!PredDep.isArtificial())
+          continue;
+        const MachineInstr *PredMI = PredDep.getSUnit()->getInstr();
+        if (PredMI && isPostRADSReadFragmentProducer(*PredMI))
+          ClusterCopies.push_back(PredDep);
+      }
+
+      // LoadClusterMutation copies every successor of the first load onto the
+      // second load. For DS_READ fragments this can make an MFMA wait for a
+      // neighboring read that is not one of its operands, serializing all
+      // clustered reads ahead of the first consumer. Retain the DS/DS cluster
+      // edge itself, but remove these copied non-data constraints so the
+      // fragment scheduler can choose reads by the MFMA heads they unlock.
+      for (const SDep &PredDep : ClusterCopies)
+        SU.removePred(PredDep);
+    }
+  }
+};
 
 class MFMAFragmentPostRASchedOrderMutation : public ScheduleDAGMutation {
   static bool hasPipelineDataPred(const SUnit &SU) {
@@ -126,6 +164,18 @@ class MFMAFragmentPostRASchedOrderMutation : public ScheduleDAGMutation {
 
 public:
   void apply(ScheduleDAGInstrs *DAG) override {
+    bool HasFragmentPipeline = llvm::any_of(DAG->SUnits, [](const SUnit &SU) {
+      const MachineInstr *MI = SU.getInstr();
+      if (!MI || !isPostRADSReadFragmentProducer(*MI))
+        return false;
+      return llvm::any_of(SU.Succs, [](const SDep &Succ) {
+        return Succ.getKind() == SDep::Data && Succ.getSUnit()->getInstr() &&
+               isPostRAMFMAFragmentConsumer(*Succ.getSUnit()->getInstr());
+      });
+    });
+    if (!HasFragmentPipeline)
+      return;
+
     SmallVector<SUnit *, 16> OrderedSUs;
     SmallVector<SUnit *, 8> ProducerRun;
 
@@ -163,6 +213,11 @@ public:
 };
 
 } // end anonymous namespace
+
+std::unique_ptr<ScheduleDAGMutation>
+llvm::createMFMAFragmentPreRASchedDAGMutation(MachineFunction *MF) {
+  return std::make_unique<MFMAFragmentPreRASchedMutation>(MF);
+}
 
 std::unique_ptr<ScheduleDAGMutation>
 llvm::createMFMAFragmentPostRASchedOrderDAGMutation() {

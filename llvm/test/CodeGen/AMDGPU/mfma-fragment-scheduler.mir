@@ -2,7 +2,16 @@
 # RUN: llc -mtriple=amdgpu9.50-amd-amdhsa -run-pass=machine-scheduler -verify-misched -amdgpu-enable-mfma-fragment-scheduler=false -o - %s | FileCheck --check-prefix=DISABLED %s
 # RUN: llc -mtriple=amdgpu9.50-amd-amdhsa -run-pass=machine-scheduler -verify-misched -amdgpu-enable-mfma-fragment-scheduler=true -o - %s | FileCheck --check-prefix=ENABLED %s
 # RUN: llc -mtriple=amdgpu9.50-amd-amdhsa -run-pass=machine-scheduler -verify-misched -amdgpu-enable-mfma-fragment-scheduler=true -o - %s | FileCheck --check-prefix=EXTRA-ENABLED %s
+# RUN: llc -mtriple=amdgpu9.50-amd-amdhsa -run-pass=machine-scheduler -verify-misched -amdgpu-enable-mfma-fragment-scheduler=true -o - %s | FileCheck --check-prefix=PATHOLOGICAL %s
 --- |
+  define amdgpu_kernel void @fragment_pipeline_blocked_chain_heads() {
+    ret void
+  }
+
+  define amdgpu_kernel void @fragment_pathological_chain_heads() {
+    ret void
+  }
+
   define amdgpu_kernel void @fragment_pipeline_clustered() {
     ret void
   }
@@ -19,6 +28,94 @@
     ret void
   }
 
+...
+
+---
+name: fragment_pathological_chain_heads
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; Generic load clustering groups adjacent offsets and copies the first
+    ; read's MFMA successor edges onto the second read. If those artificial
+    ; edges are retained, the first MFMAs are unnecessarily blocked by E1 and
+    ; the prologue grows to six reads. The copied edge is not an operand. E0
+    ; completes both the independent A and D chain heads, so it is also the
+    ; higher-unlock producer once D0 and D2 have been selected.
+    ; PATHOLOGICAL-LABEL: name: fragment_pathological_chain_heads
+    ; PATHOLOGICAL:       SCHED_BARRIER 0
+    ; PATHOLOGICAL-NEXT:  [[CH_D0:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 0,
+    ; PATHOLOGICAL-NEXT:  [[CH_D1:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 16,
+    ; PATHOLOGICAL-NEXT:  [[CH_D2:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 32,
+    ; PATHOLOGICAL-NEXT:  [[CH_D3:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 48,
+    ; PATHOLOGICAL-NEXT:  [[CH_E0:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 64,
+    ; PATHOLOGICAL-NEXT:  [[CH_A:%[0-9]+]]:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 [[CH_D0]], [[CH_E0]], [[CH_A]],
+    ; PATHOLOGICAL:       [[CH_D:%[0-9]+]]:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 [[CH_D2]], [[CH_E0]], [[CH_D]],
+    %0:vgpr_32 = IMPLICIT_DEF
+    %1:vgpr_32 = IMPLICIT_DEF
+    %2:vreg_512_align2 = IMPLICIT_DEF
+    %3:vreg_512_align2 = IMPLICIT_DEF
+    %4:vreg_512_align2 = IMPLICIT_DEF
+    %5:vreg_512_align2 = IMPLICIT_DEF
+    SCHED_BARRIER 0
+    %10:av_128_align2 = DS_READ_B128_gfx9 %0, 0, 0, implicit $exec
+    %11:av_128_align2 = DS_READ_B128_gfx9 %0, 16, 0, implicit $exec
+    %12:av_128_align2 = DS_READ_B128_gfx9 %0, 32, 0, implicit $exec
+    %13:av_128_align2 = DS_READ_B128_gfx9 %0, 48, 0, implicit $exec
+    %20:av_128_align2 = DS_READ_B128_gfx9 %1, 64, 0, implicit $exec
+    %21:av_128_align2 = DS_READ_B128_gfx9 %1, 80, 0, implicit $exec
+    %22:av_128_align2 = DS_READ_B128_gfx9 %1, 96, 0, implicit $exec
+    %23:av_128_align2 = DS_READ_B128_gfx9 %1, 112, 0, implicit $exec
+    %2:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %10, %20, %2, 0, 0, 0, implicit $mode, implicit $exec
+    %2:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %11, %21, %2, 0, 0, 0, implicit $mode, implicit $exec
+    %3:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %12, %22, %3, 0, 0, 0, implicit $mode, implicit $exec
+    %3:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %13, %23, %3, 0, 0, 0, implicit $mode, implicit $exec
+    %4:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %10, %22, %4, 0, 0, 0, implicit $mode, implicit $exec
+    %4:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %11, %23, %4, 0, 0, 0, implicit $mode, implicit $exec
+    %5:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %12, %20, %5, 0, 0, 0, implicit $mode, implicit $exec
+    S_ENDPGM 0
+...
+
+---
+name: fragment_pipeline_blocked_chain_heads
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; Four reads feed MFMAs behind unscheduled accumulator-chain predecessors.
+    ; They must not be treated as the closest MFMAs to unlock: doing so builds
+    ; an eight-read opener before either chain head becomes available. Select
+    ; the two chain heads for the four-read opener, then retain two-read
+    ; microclusters in steady state.
+    ; EXTRA-ENABLED-LABEL: name: fragment_pipeline_blocked_chain_heads
+    ; EXTRA-ENABLED:       SCHED_BARRIER 0
+    ; EXTRA-ENABLED:       [[BC_D0:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 0,
+    ; EXTRA-ENABLED-NEXT:  [[BC_D1:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 16,
+    ; EXTRA-ENABLED-NEXT:  [[BC_E0:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 64,
+    ; EXTRA-ENABLED-NEXT:  [[BC_E1:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 80,
+    ; EXTRA-ENABLED-NEXT:  [[BC_A:%[0-9]+]]:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 [[BC_D0]], [[BC_D1]], [[BC_A]],
+    ; EXTRA-ENABLED-NEXT:  [[BC_D2:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 32,
+    ; EXTRA-ENABLED-NEXT:  [[BC_D3:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 48,
+    ; EXTRA-ENABLED:       [[BC_B:%[0-9]+]]:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 [[BC_E0]], [[BC_E1]], [[BC_B]],
+    ; EXTRA-ENABLED-NEXT:  [[BC_E2:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 96,
+    ; EXTRA-ENABLED-NEXT:  [[BC_E3:%[0-9]+]]:av_128_align2 = DS_READ_B128_gfx9 {{%[0-9]+}}, 112,
+    ; EXTRA-ENABLED-NEXT:  dead [[BC_A]]:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 [[BC_D2]], [[BC_D3]], [[BC_A]],
+    ; EXTRA-ENABLED-NEXT:  dead [[BC_B]]:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 [[BC_E2]], [[BC_E3]], [[BC_B]],
+    %0:vgpr_32 = IMPLICIT_DEF
+    %1:vreg_512_align2 = IMPLICIT_DEF
+    %2:vreg_512_align2 = IMPLICIT_DEF
+    SCHED_BARRIER 0
+    %10:av_128_align2 = DS_READ_B128_gfx9 %0, 0, 0, implicit $exec
+    %11:av_128_align2 = DS_READ_B128_gfx9 %0, 16, 0, implicit $exec
+    %14:av_128_align2 = DS_READ_B128_gfx9 %0, 64, 0, implicit $exec
+    %15:av_128_align2 = DS_READ_B128_gfx9 %0, 80, 0, implicit $exec
+    %12:av_128_align2 = DS_READ_B128_gfx9 %0, 32, 0, implicit $exec
+    %13:av_128_align2 = DS_READ_B128_gfx9 %0, 48, 0, implicit $exec
+    %16:av_128_align2 = DS_READ_B128_gfx9 %0, 96, 0, implicit $exec
+    %17:av_128_align2 = DS_READ_B128_gfx9 %0, 112, 0, implicit $exec
+    %1:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %10, %11, %1, 0, 0, 0, implicit $mode, implicit $exec
+    %1:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %12, %13, %1, 0, 0, 0, implicit $mode, implicit $exec
+    %2:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %14, %15, %2, 0, 0, 0, implicit $mode, implicit $exec
+    %2:vreg_512_align2 = V_MFMA_F32_32X32X16_F16_mac_vgprcd_e64 %16, %17, %2, 0, 0, 0, implicit $mode, implicit $exec
+    S_ENDPGM 0
 ...
 
 ---

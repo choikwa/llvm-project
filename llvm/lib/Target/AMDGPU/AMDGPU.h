@@ -21,6 +21,7 @@ namespace llvm {
 
 class AMDGPUTargetMachine;
 class GCNSubtarget;
+class MachineFunction;
 class ScheduleDAGMutation;
 class LazyCallGraph;
 class GCNTargetMachine;
@@ -31,6 +32,9 @@ bool isMFMAFragmentSchedulerEnabled(const GCNSubtarget &ST);
 
 std::unique_ptr<ScheduleDAGMutation>
 createMFMAFragmentPostRASchedOrderDAGMutation();
+
+std::unique_ptr<ScheduleDAGMutation>
+createMFMAFragmentPreRASchedDAGMutation(MachineFunction *MF);
 
 // GlobalISel passes
 void initializeAMDGPUPreLegalizerCombinerPass(PassRegistry &);

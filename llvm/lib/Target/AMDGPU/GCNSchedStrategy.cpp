@@ -172,6 +172,8 @@ static cl::opt<unsigned, false, VGPRThresholdParser> VGPRThresholdPercentOpt(
 
 const unsigned ScheduleMetrics::ScaleFactor = 100;
 
+static bool hasMFMAFragmentPipeline(const ScheduleDAGMI &DAG);
+
 GCNSchedStrategy::GCNSchedStrategy(const MachineSchedContext *C)
     : GenericScheduler(C), TargetOccupancy(0), MF(nullptr),
       DownwardTracker(*C->LIS), UpwardTracker(*C->LIS), HasHighPressure(false) {
@@ -186,7 +188,11 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
   resetFragmentWindows();
 
   const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
-  EnableMFMAFragmentScheduler = isMFMAFragmentSchedulerEnabled(ST);
+  // The subtarget option only makes the tune available. Keep the generic
+  // scheduler completely unchanged for regions without the DS_READ/MFMA data
+  // flow this policy models.
+  EnableMFMAFragmentScheduler =
+      isMFMAFragmentSchedulerEnabled(ST) && hasMFMAFragmentPipeline(*DAG);
 
   SGPRExcessLimit =
       Context->RegClassInfo->getNumAllocatableRegs(&AMDGPU::SGPR_32RegClass);
@@ -341,6 +347,17 @@ static bool isMFMALike(const SUnit *SU) {
   });
 }
 
+static bool hasMFMAFragmentPipeline(const ScheduleDAGMI &DAG) {
+  for (const SUnit &SU : DAG.SUnits) {
+    if (!isDSReadLike(&SU))
+      continue;
+    for (const SDep &Succ : SU.Succs)
+      if (Succ.getKind() == SDep::Data && isMFMALike(Succ.getSUnit()))
+        return true;
+  }
+  return false;
+}
+
 static bool isSafeMFMAFragmentRampUpFiller(const SUnit *SU) {
   if (!SU || isDSReadLike(SU) || isMFMALike(SU))
     return false;
@@ -442,40 +459,13 @@ static PipeKind classifyPipeKind(SchedBoundary &Zone, SUnit *SU) {
   return PipeKind::None;
 }
 
-static unsigned getNumDSReadsToUnlockClosestMFMA(const SUnit *SU) {
-  // For every unscheduled MFMA successor, count its other unscheduled DS_READ
-  // predecessors. Return the minimum count, excluding SU itself, to prefer the
-  // DS_READ that can unlock any MFMA with the fewest additional reads.
-  if (!isDSReadLike(SU))
-    return std::numeric_limits<unsigned>::max();
-
-  unsigned MinRemaining = std::numeric_limits<unsigned>::max();
-  for (const SDep &SuccDep : SU->Succs) {
-    const SUnit *Succ = SuccDep.getSUnit();
-    if (!isMFMALike(Succ) || Succ->isScheduled)
-      continue;
-
-    unsigned Remaining = 0;
-    for (const SDep &PredDep : Succ->Preds) {
-      const SUnit *Pred = PredDep.getSUnit();
-      if (!isDSReadLike(Pred) || Pred == SU || Pred->isScheduled)
-        continue;
-      ++Remaining;
-    }
-
-    MinRemaining = std::min(MinRemaining, Remaining);
-  }
-
-  return MinRemaining;
-}
-
 static unsigned
 countScheduledDSReadPredsToMFMASuccessorAfter(const SUnit *SU,
                                               const SUnit *Succ) {
   unsigned Count = 0;
   for (const SDep &PredDep : Succ->Preds) {
     const SUnit *Pred = PredDep.getSUnit();
-    if (!isDSReadLike(Pred))
+    if (PredDep.getKind() != SDep::Data || !isDSReadLike(Pred))
       continue;
     if (Pred == SU || Pred->isScheduled)
       ++Count;
@@ -490,7 +480,8 @@ countUnscheduledDSReadPredsToMFMASuccessorAfter(const SUnit *SU,
   unsigned Count = 0;
   for (const SDep &PredDep : Succ->Preds) {
     const SUnit *Pred = PredDep.getSUnit();
-    if (!isDSReadLike(Pred) || Pred == SU || Pred->isScheduled)
+    if (PredDep.getKind() != SDep::Data || !isDSReadLike(Pred) || Pred == SU ||
+        Pred->isScheduled)
       continue;
     ++Count;
   }
@@ -503,12 +494,49 @@ hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(const SUnit *SU,
                                                  const SUnit *Succ) {
   for (const SDep &PredDep : Succ->Preds) {
     const SUnit *Pred = PredDep.getSUnit();
+    if (PredDep.getKind() != SDep::Data)
+      continue;
     if (isDSReadLike(Pred) || Pred == SU || Pred->isScheduled)
       continue;
     return true;
   }
 
   return false;
+}
+
+static unsigned getNumDSReadsToUnlockClosestMFMA(const SUnit *SU) {
+  // For every unscheduled MFMA successor, count its other unscheduled DS_READ
+  // predecessors. Ignore successors that still have an unscheduled non-DS
+  // predecessor, such as the preceding instruction in an accumulator chain:
+  // issuing their operands cannot make that MFMA ready yet. Return the minimum
+  // count, excluding SU itself, to prefer the DS_READ that can unlock any MFMA
+  // with the fewest additional reads.
+  if (!isDSReadLike(SU))
+    return std::numeric_limits<unsigned>::max();
+
+  unsigned MinRemaining = std::numeric_limits<unsigned>::max();
+  for (const SDep &SuccDep : SU->Succs) {
+    const SUnit *Succ = SuccDep.getSUnit();
+    if (SuccDep.getKind() != SDep::Data || !isMFMALike(Succ) ||
+        Succ->isScheduled)
+      continue;
+
+    if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
+      continue;
+
+    unsigned Remaining = 0;
+    for (const SDep &PredDep : Succ->Preds) {
+      const SUnit *Pred = PredDep.getSUnit();
+      if (PredDep.getKind() != SDep::Data || !isDSReadLike(Pred) ||
+          Pred == SU || Pred->isScheduled)
+        continue;
+      ++Remaining;
+    }
+
+    MinRemaining = std::min(MinRemaining, Remaining);
+  }
+
+  return MinRemaining;
 }
 
 static unsigned countMFMASuccessorsUnlockedBy(const SUnit *SU) {
@@ -518,7 +546,8 @@ static unsigned countMFMASuccessorsUnlockedBy(const SUnit *SU) {
   unsigned Count = 0;
   for (const SDep &SuccDep : SU->Succs) {
     const SUnit *Succ = SuccDep.getSUnit();
-    if (!isMFMALike(Succ) || Succ->isScheduled)
+    if (SuccDep.getKind() != SDep::Data || !isMFMALike(Succ) ||
+        Succ->isScheduled)
       continue;
 
     if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
@@ -539,7 +568,8 @@ static unsigned countMFMASuccessorsUnlockedByAfterFiller(const SUnit *SU,
   unsigned Count = 0;
   for (const SDep &SuccDep : SU->Succs) {
     const SUnit *Succ = SuccDep.getSUnit();
-    if (!isMFMALike(Succ) || Succ->isScheduled || Succ == Filler)
+    if (SuccDep.getKind() != SDep::Data || !isMFMALike(Succ) ||
+        Succ->isScheduled || Succ == Filler)
       continue;
 
     bool HasFillerPred = false;
@@ -572,7 +602,8 @@ static unsigned getBestMFMASuccessorMissingDSReadPredsAfter(const SUnit *SU) {
   unsigned BestMissing = std::numeric_limits<unsigned>::max();
   for (const SDep &SuccDep : SU->Succs) {
     const SUnit *Succ = SuccDep.getSUnit();
-    if (!isMFMALike(Succ) || Succ->isScheduled)
+    if (SuccDep.getKind() != SDep::Data || !isMFMALike(Succ) ||
+        Succ->isScheduled)
       continue;
 
     if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
@@ -597,7 +628,8 @@ static unsigned getBestMFMASuccessorScheduledDSReadPredsAfter(const SUnit *SU) {
   unsigned BestScheduled = 0;
   for (const SDep &SuccDep : SU->Succs) {
     const SUnit *Succ = SuccDep.getSUnit();
-    if (!isMFMALike(Succ) || Succ->isScheduled)
+    if (SuccDep.getKind() != SDep::Data || !isMFMALike(Succ) ||
+        Succ->isScheduled)
       continue;
 
     if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
@@ -625,7 +657,8 @@ static unsigned getBestMFMASuccessorNodeNumAfter(const SUnit *SU) {
   unsigned BestNodeNum = std::numeric_limits<unsigned>::max();
   for (const SDep &SuccDep : SU->Succs) {
     const SUnit *Succ = SuccDep.getSUnit();
-    if (!isMFMALike(Succ) || Succ->isScheduled)
+    if (SuccDep.getKind() != SDep::Data || !isMFMALike(Succ) ||
+        Succ->isScheduled)
       continue;
 
     if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
@@ -650,7 +683,8 @@ countMFMASuccessorsWithFewMissingDSReadPredsAfter(const SUnit *SU,
   unsigned Count = 0;
   for (const SDep &SuccDep : SU->Succs) {
     const SUnit *Succ = SuccDep.getSUnit();
-    if (!isMFMALike(Succ) || Succ->isScheduled)
+    if (SuccDep.getKind() != SDep::Data || !isMFMALike(Succ) ||
+        Succ->isScheduled)
       continue;
 
     if (hasUnscheduledNonDSReadPredsToMFMASuccessorAfter(SU, Succ))
@@ -682,7 +716,8 @@ getDirectFragmentProducerScore(const SUnit *SU) {
 
   for (const SDep &SuccDep : SU->Succs) {
     const SUnit *Succ = SuccDep.getSUnit();
-    if (!isMFMALike(Succ) || Succ->isScheduled)
+    if (SuccDep.getKind() != SDep::Data || !isMFMALike(Succ) ||
+        Succ->isScheduled)
       continue;
 
     unsigned Missing =
@@ -764,10 +799,15 @@ isBetterPrologueFragmentScore(const MFMAFragmentProducerScore &TryScore,
   if (!TryScore.Valid)
     return false;
 
-  if (TryScore.BestMissingDS != CandScore.BestMissingDS)
-    return TryScore.BestMissingDS < CandScore.BestMissingDS;
+  // Prefer a read that immediately exposes the most usable MFMA work. An
+  // MFMA behind an unscheduled accumulator-chain predecessor is excluded from
+  // Unlocks, so several serial consumers do not masquerade as independent
+  // latency-hiding fillers. If neither candidate exposes more work now, fall
+  // back to completing the closest MFMA with the fewest additional reads.
   if (TryScore.Unlocks != CandScore.Unlocks)
     return TryScore.Unlocks > CandScore.Unlocks;
+  if (TryScore.BestMissingDS != CandScore.BestMissingDS)
+    return TryScore.BestMissingDS < CandScore.BestMissingDS;
   if (TryScore.BestScheduledDS != CandScore.BestScheduledDS)
     return TryScore.BestScheduledDS > CandScore.BestScheduledDS;
   if (TryScore.BestSuccNode != CandScore.BestSuccNode)
@@ -1544,7 +1584,7 @@ bool GCNSchedStrategy::tryMFMASteadyState(
   bool TryDrainMFMA = TryDrainBurstMFMA;
   bool CandDrainMFMA = CandDrainBurstMFMA;
   if (FWS.HasPickedMFMA && FWS.LastPickWasDSRead &&
-      FWS.LiveFragments < EffectiveMaxWindow &&
+      FWS.LiveFragments <= EffectiveMaxWindow &&
       ((TryProducer && CandDrainMFMA) || (CandProducer && TryDrainMFMA))) {
     bool NeedsSecondDS =
         FWS.DSReadsSinceLastMFMA < MFMAFragmentSched.PipelineGroupSize;
@@ -1909,13 +1949,19 @@ static SUnit *findTopMFMAFillerForRecentDS(
     const DenseMap<const SUnit *, unsigned> &RecentDSReadUnrelatedMFMAs,
     bool &FillerPending) {
   if (!TopSU || !HasPickedMFMA ||
-      classifyPipeKind(Top, TopSU) != PipeKind::FragmentProducer ||
       !hasRecentDSReadSpacingDebt(RecentDSReadUnrelatedMFMAs))
+    return nullptr;
+
+  PipeKind TopKind = classifyPipeKind(Top, TopSU);
+  bool NeedsFiller =
+      TopKind == PipeKind::FragmentProducer ||
+      ((TopKind == PipeKind::ReadyMFMA || TopKind == PipeKind::PendingMFMA) &&
+       consumesImmatureRecentDSRead(TopSU, RecentDSReadUnrelatedMFMAs));
+  if (!NeedsFiller)
     return nullptr;
 
   SUnit *Best = nullptr;
   unsigned BestBenefit = 0;
-  unsigned BestConsumedSpacing = 0;
   unsigned BestStall = std::numeric_limits<unsigned>::max();
   unsigned BestReadyStall = std::numeric_limits<unsigned>::max();
   bool BestPending = false;
@@ -1926,19 +1972,19 @@ static SUnit *findTopMFMAFillerForRecentDS(
       return;
 
     unsigned Benefit = 0;
-    unsigned ConsumedSpacing = MFMAFragmentSched.PipelineGroupSize;
     for (const auto &DSRead : RecentDSReadUnrelatedMFMAs) {
       if (DSRead.second >= MFMAFragmentSched.PipelineGroupSize)
         continue;
 
-      if (consumesThisDSRead(SU, DSRead.first)) {
-        ConsumedSpacing = std::min(ConsumedSpacing, DSRead.second);
-        continue;
-      }
+      // A filler must advance every outstanding maturity window. Consuming
+      // one immature read while helping another merely transfers the exposed
+      // latency within a two-read microcluster.
+      if (consumesThisDSRead(SU, DSRead.first))
+        return;
 
       Benefit += MFMAFragmentSched.PipelineGroupSize - DSRead.second;
     }
-    if (!Benefit || ConsumedSpacing == 0)
+    if (!Benefit)
       return;
 
     unsigned Stall = getEffectiveStall(Top, SU);
@@ -1949,29 +1995,21 @@ static SUnit *findTopMFMAFillerForRecentDS(
     bool Better = !Best;
     if (!Better && Benefit != BestBenefit)
       Better = Benefit > BestBenefit;
-    if (!Better && Benefit == BestBenefit &&
-        ConsumedSpacing != BestConsumedSpacing)
-      Better = ConsumedSpacing > BestConsumedSpacing;
-    if (!Better && Benefit == BestBenefit &&
-        ConsumedSpacing == BestConsumedSpacing && Stall != BestStall)
+    if (!Better && Benefit == BestBenefit && Stall != BestStall)
       Better = Stall < BestStall;
-    if (!Better && Benefit == BestBenefit &&
-        ConsumedSpacing == BestConsumedSpacing && Stall == BestStall &&
+    if (!Better && Benefit == BestBenefit && Stall == BestStall &&
         ReadyStall != BestReadyStall)
       Better = ReadyStall < BestReadyStall;
-    if (!Better && Benefit == BestBenefit &&
-        ConsumedSpacing == BestConsumedSpacing && Stall == BestStall &&
+    if (!Better && Benefit == BestBenefit && Stall == BestStall &&
         ReadyStall == BestReadyStall && IsPending != BestPending)
       Better = IsPending < BestPending;
-    if (!Better && Benefit == BestBenefit &&
-        ConsumedSpacing == BestConsumedSpacing && Stall == BestStall &&
+    if (!Better && Benefit == BestBenefit && Stall == BestStall &&
         ReadyStall == BestReadyStall && IsPending == BestPending)
       Better = SU->NodeNum < Best->NodeNum;
 
     if (Better) {
       Best = SU;
       BestBenefit = Benefit;
-      BestConsumedSpacing = ConsumedSpacing;
       BestStall = Stall;
       BestReadyStall = ReadyStall;
       BestPending = IsPending;
@@ -2525,8 +2563,11 @@ SUnit *GCNSchedStrategy::pickNodeBidirectional(bool &IsTopNode,
           (TopFragmentWindow.CompletedDSMicroclusters < 2
                ? 1
                : MFMAFragmentSched.PipelineGroupSize);
-  if (EnableMFMAFragmentScheduler &&
-      TopFragmentWindow.LiveFragments < TopFragmentWindow.MaxWindow &&
+  bool CanAddMicroclusterDS =
+      NeedsSecondClusterDS
+          ? TopFragmentWindow.LiveFragments <= TopFragmentWindow.MaxWindow
+          : TopFragmentWindow.LiveFragments < TopFragmentWindow.MaxWindow;
+  if (EnableMFMAFragmentScheduler && CanAddMicroclusterDS &&
       (StartReadyMicrocluster || NeedsSecondClusterDS)) {
     auto ConsiderDS = [&](SUnit *SU, bool FromPending) {
       if (!isDSReadLike(SU) || getEffectiveStall(Top, SU) != 0)
@@ -2552,8 +2593,11 @@ SUnit *GCNSchedStrategy::pickNodeBidirectional(bool &IsTopNode,
                                     BotFragmentWindow.LastPickWasDSRead &&
                                     BotFragmentWindow.DSReadsSinceLastMFMA <
                                         MFMAFragmentSched.PipelineGroupSize;
-  if (EnableMFMAFragmentScheduler &&
-      BotFragmentWindow.LiveFragments < BotFragmentWindow.MaxWindow &&
+  bool BottomCanAddMicroclusterDS =
+      BottomNeedsSecondClusterDS
+          ? BotFragmentWindow.LiveFragments <= BotFragmentWindow.MaxWindow
+          : BotFragmentWindow.LiveFragments < BotFragmentWindow.MaxWindow;
+  if (EnableMFMAFragmentScheduler && BottomCanAddMicroclusterDS &&
       BottomNeedsSecondClusterDS) {
     auto ConsiderDS = [&](SUnit *SU, bool FromPending) {
       if (!isDSReadLike(SU) || getEffectiveStall(Bot, SU) != 0)
