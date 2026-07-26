@@ -749,11 +749,8 @@ createGCNMaxOccupancyMachineScheduler(MachineSchedContext *C) {
   DAG->addMutation(createLoadClusterDAGMutation(DAG->TII, DAG->TRI));
   if (ST.shouldClusterStores())
     DAG->addMutation(createStoreClusterDAGMutation(DAG->TII, DAG->TRI));
-  DAG->addMutation(createIGroupLPDAGMutation(AMDGPU::SchedulingPhase::Initial));
   DAG->addMutation(createAMDGPUMacroFusionDAGMutation());
-  DAG->addMutation(createAMDGPUExportClusteringDAGMutation());
-  DAG->addMutation(createAMDGPUBarrierLatencyDAGMutation(C->MF));
-  DAG->addMutation(createAMDGPUHazardLatencyDAGMutation(C->MF));
+  DAG->addMutation(createIGroupLPDAGMutation(AMDGPU::SchedulingPhase::Initial));
   return DAG;
 }
 
@@ -805,8 +802,26 @@ createIterativeILPMachineScheduler(MachineSchedContext *C) {
   DAG->addMutation(createLoadClusterDAGMutation(DAG->TII, DAG->TRI));
   if (ST.shouldClusterStores())
     DAG->addMutation(createStoreClusterDAGMutation(DAG->TII, DAG->TRI));
-  DAG->addMutation(createAMDGPUMacroFusionDAGMutation());
   DAG->addMutation(createIGroupLPDAGMutation(AMDGPU::SchedulingPhase::Initial));
+  DAG->addMutation(createAMDGPUMacroFusionDAGMutation());
+  DAG->addMutation(createAMDGPUExportClusteringDAGMutation());
+  DAG->addMutation(createAMDGPUBarrierLatencyDAGMutation(C->MF));
+  DAG->addMutation(createAMDGPUHazardLatencyDAGMutation(C->MF));
+  return DAG;
+}
+
+static ScheduleDAGInstrs *
+createAnnealingMachineScheduler(MachineSchedContext *C) {
+  const GCNSubtarget &ST = C->MF->getSubtarget<GCNSubtarget>();
+  auto *DAG = createGCNAnnealingScheduler(C);
+  DAG->addMutation(createLoadClusterDAGMutation(DAG->TII, DAG->TRI));
+  if (ST.shouldClusterStores())
+    DAG->addMutation(createStoreClusterDAGMutation(DAG->TII, DAG->TRI));
+  DAG->addMutation(createIGroupLPDAGMutation(AMDGPU::SchedulingPhase::Initial));
+  DAG->addMutation(createAMDGPUMacroFusionDAGMutation());
+  DAG->addMutation(createAMDGPUExportClusteringDAGMutation());
+  DAG->addMutation(createAMDGPUBarrierLatencyDAGMutation(C->MF));
+  DAG->addMutation(createAMDGPUHazardLatencyDAGMutation(C->MF));
   return DAG;
 }
 
@@ -841,6 +856,10 @@ static MachineSchedRegistry GCNILPSchedRegistry(
     "gcn-iterative-ilp",
     "Run GCN iterative scheduler for ILP scheduling (experimental)",
     createIterativeILPMachineScheduler);
+
+static MachineSchedRegistry GCNAnnealingSchedRegistry(
+    "gcn-annealing", "Run experimental GCN simulated annealing scheduler",
+    createAnnealingMachineScheduler);
 
 LLVM_READNONE
 static StringRef getGPUOrDefault(const Triple &TT, StringRef GPU) {

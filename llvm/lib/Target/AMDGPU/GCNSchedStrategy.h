@@ -257,7 +257,7 @@ public:
 using RegionBoundaries =
     std::pair<MachineBasicBlock::iterator, MachineBasicBlock::iterator>;
 
-class GCNScheduleDAGMILive final : public ScheduleDAGMILive {
+class GCNScheduleDAGMILive : public ScheduleDAGMILive {
   friend class GCNSchedStage;
   friend class OccInitialScheduleStage;
   friend class RewriteMFMAFormStage;
@@ -328,6 +328,13 @@ class GCNScheduleDAGMILive final : public ScheduleDAGMILive {
   void runSchedStages();
 
   std::unique_ptr<GCNSchedStage> createSchedStage(GCNSchedStageID SchedStageID);
+
+protected:
+  ArrayRef<RegionBoundaries> getRegions() const { return Regions; }
+
+  /// Extension point for schedulers that post-process the exact schedule
+  /// emitted by the production GCN scheduling stages.
+  virtual void finalizeGCNSchedule() {}
 
 public:
   GCNScheduleDAGMILive(MachineSchedContext *C,

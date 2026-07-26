@@ -26,6 +26,8 @@ class MachineInstr;
 class SUnit;
 class raw_ostream;
 
+ScheduleDAGMILive *createGCNAnnealingScheduler(MachineSchedContext *C);
+
 class GCNIterativeScheduler : public ScheduleDAGMILive {
   using BaseClass = ScheduleDAGMILive;
 
@@ -34,11 +36,16 @@ public:
     SCHEDULE_MINREGONLY,
     SCHEDULE_MINREGFORCED,
     SCHEDULE_LEGACYMAXOCCUPANCY,
-    SCHEDULE_ILP
+    SCHEDULE_ILP,
+    SCHEDULE_ANNEALING
   };
 
   GCNIterativeScheduler(MachineSchedContext *C,
-                        StrategyKind S);
+                        StrategyKind S, bool UseCurrentSchedule = false);
+
+  /// Anneal regions that have already been scheduled by another scheduler.
+  void annealRegions(ArrayRef<std::pair<MachineBasicBlock::iterator,
+                                        MachineBasicBlock::iterator>> Regions);
 
   void schedule() override;
 
@@ -75,6 +82,7 @@ protected:
 
   MachineSchedContext *Context;
   const StrategyKind Strategy;
+  const bool UseCurrentSchedule;
   mutable GCNUpwardRPTracker UPTracker;
 
   std::vector<std::unique_ptr<ScheduleDAGMutation>> SavedMutations;
@@ -114,6 +122,7 @@ protected:
   void scheduleLegacyMaxOccupancy(bool TryMaximizeOccupancy = true);
   void scheduleMinReg(bool force = false);
   void scheduleILP(bool TryMaximizeOccupancy = true);
+  void scheduleAnnealing();
 
   void printRegions(raw_ostream &OS) const;
   void printSchedResult(raw_ostream &OS,
