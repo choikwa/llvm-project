@@ -12,6 +12,7 @@
 #include "AMDGPUHazardLatency.h"
 #include "AMDGPUIGroupLP.h"
 #include "AMDGPUMacroFusion.h"
+#include "GCNRegPressure.h"
 #include "GCNSchedStrategy.h"
 #include "GCNSubtarget.h"
 #include "llvm/ADT/DenseMap.h"
@@ -101,6 +102,16 @@ bool GCNCompleteScheduleOptimizer::validateCompleteSchedule(
   if (Founder.size() != Region.size())
     return false;
 
+  return preservesLocalVRegOrder(Region, Founder, Result) &&
+         validateGCNCompleteSchedule(Region, Founder, Result);
+}
+
+bool GCNCompleteScheduleOptimizer::preservesLocalVRegOrder(
+    const MachineSchedSearchRegion &Region, ArrayRef<unsigned> Founder,
+    ArrayRef<unsigned> Result) const {
+  if (Founder.size() != Region.size() || Result.size() != Region.size())
+    return false;
+
   // ScheduleDAG dependencies are the primary legality source, but large
   // regions may omit ordering between partial virtual-register definitions
   // and uses that LiveIntervals still requires. Preserve every local def/use
@@ -136,7 +147,26 @@ bool GCNCompleteScheduleOptimizer::validateCompleteSchedule(
     }
   }
 
-  return validateGCNCompleteSchedule(Region, Founder, Result);
+  return true;
+}
+
+GCNRegPressure llvm::AMDGPU::getGCNCompleteSchedulePressure(
+    const MachineSchedSearchRegion &Region, ArrayRef<unsigned> Order,
+    const LiveIntervals &LIS) {
+  const ScheduleDAGMI &DAG = *Region.getDAG();
+  MachineBasicBlock *MBB =
+      Region.getSUnit(Order.front()).getInstr()->getParent();
+  auto BBEnd = MBB->end();
+  GCNUpwardRPTracker Tracker(LIS);
+  if (DAG.end() != BBEnd) {
+    Tracker.reset(*DAG.end());
+    Tracker.recede(*DAG.end());
+  } else {
+    Tracker.reset(*std::prev(BBEnd));
+  }
+  for (unsigned Node : reverse(Order))
+    Tracker.recede(*Region.getSUnit(Node).getInstr());
+  return Tracker.getMaxPressureAndReset();
 }
 
 ScheduleDAGInstrs *llvm::AMDGPU::createGCNPostScheduleOptimizerScheduler(

@@ -68,9 +68,8 @@ public:
       if (Range.Begin == OldPosition)
         continue;
 
-      Result.erase(Result.begin() + OldPosition);
-      Result.insert(Result.begin() + Range.Begin, Node);
-      return true;
+      return Region.applyRelocation(
+          Result, {Node, OldPosition, Range.Begin}, Result);
     }
     return false;
   }
@@ -94,7 +93,9 @@ Useful operations on `MachineSchedSearchRegion` include:
 - `predecessors(Node)` and `successors(Node)` for strong dependencies;
 - `isLegalOrder(Order)` for complete permutation and dependency validation;
 - `getLegalMoveRange(Order, Node, Range)` for a dependency-preserving
-  remove-and-reinsert mutation; and
+  remove-and-reinsert mutation;
+- `applyRelocation(Order, Move, Result)` to apply that mutation using the same
+  position semantics as other complete-schedule clients; and
 - `getInitialOrder()` and `getTopologicalOrder()` for deterministic starting
   orders.
 
@@ -210,6 +211,88 @@ The same callback can instead call a beam-search or learned-policy library.  In
 all cases it should return the best complete legal order it selected, not its
 internal search state.
 
+## Generate AMDGPU schedules and training trajectories
+
+AMDGPU also provides a file-based endpoint for external search and training
+data generation.  Like the historical deep-SA harness, it launches a fresh
+compiler for each candidate.  The external process retains the search state;
+LLVM reconstructs the post-MaxOccupancy region, replays the parent, creates a
+legal child, emits its features, and compiles the selected endpoint.
+
+The initial implementation is restricted to `gfx950` so that every emitted
+feature vector has the same target semantics as the frozen C33 schema.
+
+Record the production founder and its state features:
+
+```console
+$ build/bin/llc input.ll -o founder.s \
+    -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 \
+    -amdgpu-prera-training-function=matmul_kernel \
+    -amdgpu-prera-training-record-schedule=founder.schedule \
+    -amdgpu-prera-training-record-trajectory=founder.jsonl
+```
+
+Generate a reproducible depth-8 child from that founder:
+
+```console
+$ build/bin/llc input.ll -o child.s \
+    -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 \
+    -amdgpu-prera-training-function=matmul_kernel \
+    -amdgpu-prera-training-replay-schedule=founder.schedule \
+    -amdgpu-prera-training-mutation-region=0 \
+    -amdgpu-prera-training-mutation-depth=8 \
+    -amdgpu-prera-training-seed=17 \
+    -amdgpu-prera-training-record-schedule=child.schedule \
+    -amdgpu-prera-training-record-trajectory=child.jsonl
+```
+
+The schedule file is a versioned tab-separated interchange format:
+
+```text
+amdgpu-prera-schedule-v1<TAB>function<TAB>region<TAB>fingerprint<TAB>order
+```
+
+The fingerprint covers the function, region, post-MaxOccupancy founder,
+instructions, and strong dependency graph.  Replay fails rather than silently
+falling back when the fingerprint, permutation, DAG legality, or AMDGPU local
+virtual-register ordering does not match.
+
+The trajectory file is JSON Lines.  It contains a starting state record, one
+transition record for every completed relocation, an endpoint record for the
+whole depth-N proposal, and a selected-state record.  The endpoint's action
+features use the same first-move, cumulative-distance, and depth semantics as
+neural deployment.  Action records include:
+
+- function, region, fingerprint, seed, requested depth, and step;
+- parent and child schedule hashes and complete ordinal orders;
+- moved node and old/new positions;
+- the exact 22-element parent and child state vectors;
+- the exact 55-element action vector consumed by the neural model;
+- the frozen feature-schema SHA-256; and
+- estimated parent/child VGPR, SGPR, and occupancy values.
+
+Output files are opened in append mode so one compilation can record multiple
+functions and regions.  The controlling harness should remove or rotate them
+before starting a new candidate.  `-amdgpu-prera-training-function` is strongly
+recommended when a module contains more than the one kernel being optimized.
+
+An external hardware-in-the-loop controller can therefore use the same pattern
+as the ROCm deep-SA experiments:
+
+```text
+record founder once
+repeat:
+  invoke compiler to replay parent and generate one legal child
+  verify child by replaying and re-recording it
+  execute child and collect runtime
+  perform Metropolis acceptance externally
+  append runtime and acceptance labels using the emitted hashes
+```
+
+Only the endpoint of a depth-N walk reaches the downstream compiler pipeline.
+Every intermediate relocation is nevertheless legal and is present in the
+JSONL trajectory.
+
 ## Run the experimental AMDGPU neural optimizer
 
 The current AMDGPU client implements iterative complete-schedule search with a
@@ -249,51 +332,47 @@ This search performs no hardware measurements.  It extracts 22 complete-state
 features and 55 parent/action/child features, runs native float32 inference,
 and iteratively retains promising complete schedules.
 
-## Training and hardware-in-the-loop search
+## Training and hardware-in-the-loop ownership
 
-The API can be used while generating training data, but it is not a training
-framework.  A data-collection optimizer can enumerate or sample complete legal
-orders, compute static labels or features, and serialize those records from
-`optimizeCompleteSchedule()`.  Model training remains an external step.  A
-model whose input schema or label semantics change must be retrained and
-exported with a matching schema identifier; merely moving the same optimizer
-behind this API does not require retraining.
+The API and AMDGPU endpoint generate training data, but they are not a training
+framework.  Model training remains an external step.  A model whose input
+schema or label semantics change must be retrained and exported with a matching
+schema identifier; merely moving the same optimizer behind this API does not
+require retraining.
 
-Hardware-in-the-loop search also requires an external persistent controller.
-The in-process callback is synchronous: LLVM expects it to return a selected
-order before compilation continues.  The current API supplies the schedule
-representation, legality checks, replay, and target bookkeeping, but it does
-not define a compiler/controller protocol, launch GPU workloads, feed runtime
-measurements back to a search, or implement simulated-annealing acceptance.
+Hardware-in-the-loop search requires an external controller.  The file-based
+AMDGPU endpoint is the compiler/controller protocol for a process-per-candidate
+workflow, but LLVM does not launch GPU workloads, feed runtime measurements
+back to the search, or implement empirical simulated-annealing acceptance.
 
 A hardware-in-the-loop system can use this API as its compiler-side endpoint:
 
-1. Freeze or serialize the scheduling region and founder.
-2. Have the external controller propose complete ordinal orders or legal
-   relocations.
-3. Recompile/replay each candidate through a client optimizer.
+1. Record the scheduling region and founder.
+2. Have LLVM generate a legal endpoint, or have the controller submit a
+   previously recorded complete order.
+3. Recompile/replay each candidate through the training endpoint.
 4. Run and measure the candidate externally.
 5. Feed the runtime to the persistent controller, which chooses the next
    proposal.
 6. Replay the controller's selected order for the final compilation.
 
-Defining that transport and persistence protocol is intentionally separate
-from the generic machine-scheduler API.
+The controller can remain a normal script launching one compiler process per
+candidate.  A persistent compiler worker or RPC transport could reduce startup
+cost, but is an optional optimization rather than a requirement.
 
 ## Facilities intentionally not supplied by the base API
 
-The current interface does not provide:
+The generic interface does not provide:
 
 - a global registry or command-line enum for choosing a search algorithm;
 - a generic feature schema, objective, model format, or inference engine;
-- candidate logging or trajectory serialization;
-- a wire protocol for an external controller; or
 - hardware execution and runtime feedback.
 
-Those components have target-, experiment-, and deployment-specific ownership.
-A target can expose its own registry or command-line option and construct the
-corresponding `MachineSchedCompleteScheduleOptimizer`.  If several targets
-later need the same facility, it can be promoted independently without
+The AMDGPU client supplies schedule serialization and JSONL trajectory output,
+while hardware execution and labels remain external.  Other targets can expose
+their own recorders and construct the corresponding
+`MachineSchedCompleteScheduleOptimizer`.  If several targets later need the
+same serialization facility, it can be promoted independently without
 coupling the complete-order representation to one search method.
 
 ## Correctness checklist

@@ -125,6 +125,32 @@ bool MachineSchedSearchRegion::getLegalMoveRange(ArrayRef<unsigned> Order,
   return true;
 }
 
+bool MachineSchedSearchRegion::applyRelocation(
+    ArrayRef<unsigned> Order, Relocation Move,
+    SmallVectorImpl<unsigned> &Result) const {
+  if (Move.Node >= size() || Move.From >= size() || Move.To >= size() ||
+      !isLegalOrder(Order) || Order[Move.From] != Move.Node)
+    return false;
+
+  MoveRange Range;
+  if (!getLegalMoveRange(Order, Move.Node, Range) || Move.To < Range.Begin ||
+      Move.To > Range.End)
+    return false;
+
+  SmallVector<unsigned, 0> Candidate(Order);
+  if (Move.From < Move.To)
+    std::rotate(Candidate.begin() + Move.From,
+                Candidate.begin() + Move.From + 1,
+                Candidate.begin() + Move.To + 1);
+  else if (Move.To < Move.From)
+    std::rotate(Candidate.begin() + Move.To, Candidate.begin() + Move.From,
+                Candidate.begin() + Move.From + 1);
+
+  assert(isLegalOrder(Candidate) && "legal relocation produced illegal order");
+  Result.assign(Candidate.begin(), Candidate.end());
+  return true;
+}
+
 MachineSchedCompleteScheduleReplayer::MachineSchedCompleteScheduleReplayer(
     std::unique_ptr<MachineSchedCompleteScheduleOptimizer> Optimizer)
     : Optimizer(std::move(Optimizer)) {

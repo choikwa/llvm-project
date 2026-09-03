@@ -23,6 +23,11 @@ class TargetRegisterInfo;
 
 namespace AMDGPU {
 
+inline constexpr StringLiteral LearnedPreRAFeatureSchemaSHA256 =
+    "f346529d24c027c55709e9dac6744d561cfa7d46ee30a727fe5ddc327515ee62";
+inline constexpr unsigned LearnedPreRAStateFeatureCount = 22;
+inline constexpr unsigned LearnedPreRAActionFeatureCount = 55;
+
 /// Region-local, immutable adapter from LLVM's ScheduleDAG state to the exact
 /// 22-state/55-action feature schema used by Learned PreRA Scheduler v0.
 class LearnedPreRARegionFeatures {

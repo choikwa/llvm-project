@@ -232,6 +232,26 @@ TEST(MachineSchedSearchRegion, ComputesLegalRelocationRange) {
   EXPECT_FALSE(Region.getLegalMoveRange(Order, 5, Range));
 }
 
+TEST(MachineSchedSearchRegion, AppliesLegalRelocation) {
+  std::array<SUnit, 5> Nodes;
+  initializeTestDAG(Nodes);
+  MachineSchedSearchRegion Region(Nodes);
+  const unsigned Order[] = {0, 1, 2, 3, 4};
+  SmallVector<unsigned> Result;
+
+  EXPECT_TRUE(Region.applyRelocation(Order, {4, 4, 0}, Result));
+  EXPECT_EQ(Result, (SmallVector<unsigned, 5>{4, 0, 1, 2, 3}));
+
+  EXPECT_TRUE(Region.applyRelocation(Order, {0, 0, 1}, Result));
+  EXPECT_EQ(Result, (SmallVector<unsigned, 5>{1, 0, 2, 3, 4}));
+
+  Result.assign(1, 9);
+  EXPECT_FALSE(Region.applyRelocation(Order, {2, 2, 1}, Result));
+  EXPECT_EQ(Result, (SmallVector<unsigned, 1>{9}));
+  EXPECT_FALSE(Region.applyRelocation(Order, {4, 0, 1}, Result));
+  EXPECT_FALSE(Region.applyRelocation({2, 0, 1, 3, 4}, {2, 0, 1}, Result));
+}
+
 TEST(MachineSchedCompleteScheduleReplayer, ReplaysValidatedCompleteOrder) {
   EXPECT_EQ(initializeAndPick({2, 0, 1}), (SmallVector<unsigned, 3>{2, 0, 1}));
 }

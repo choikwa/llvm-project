@@ -133,6 +133,7 @@ add_llvm_target(AMDGPUCodeGen
   GCNCompleteScheduleOptimizer.cpp
   GCNDPPCombine.cpp
   GCNLearnedScheduleOptimizer.cpp
+  GCNScheduleTraining.cpp
   GCNHazardRecognizer.cpp
   GCNILPSched.cpp
   GCNIterativeScheduler.cpp

@@ -1414,6 +1414,20 @@ Error GCNTargetMachine::buildCodeGenPipeline(
 ScheduleDAGInstrs *
 GCNTargetMachine::createMachineScheduler(MachineSchedContext *C) const {
   const GCNSubtarget &ST = C->MF->getSubtarget<GCNSubtarget>();
+
+  if (AMDGPU::isGCNScheduleTrainingEnabled()) {
+    if (AMDGPU::isGCNNeuralScheduleEnabled())
+      report_fatal_error("AMDGPU pre-RA training and neural search modes are "
+                         "mutually exclusive");
+    if (ST.getCPU() != "gfx950")
+      report_fatal_error(
+          "AMDGPU pre-RA training endpoint currently requires gfx950");
+    if (ST.enableSIScheduler())
+      report_fatal_error("AMDGPU pre-RA training endpoint is incompatible "
+                         "with the SI scheduler");
+    return AMDGPU::createGCNScheduleTrainingScheduler(C);
+  }
+
   if (ST.enableSIScheduler())
     return createSIMachineScheduler(C);
 

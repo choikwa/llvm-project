@@ -37,6 +37,14 @@ namespace llvm {
 /// while the underlying SUnit storage remains alive and unchanged.
 class LLVM_ABI MachineSchedSearchRegion {
 public:
+  /// A remove-and-reinsert operation on a complete schedule. Positions refer
+  /// to the order before and after the operation respectively.
+  struct Relocation {
+    unsigned Node;
+    unsigned From;
+    unsigned To;
+  };
+
   struct MoveRange {
     /// First legal final position after removing and reinserting the node.
     unsigned Begin;
@@ -83,6 +91,13 @@ public:
   /// false if the input order is not legal or the node ordinal is invalid.
   bool getLegalMoveRange(ArrayRef<unsigned> Order, unsigned Node,
                          MoveRange &Range) const;
+
+  /// Apply a legal remove-and-reinsert operation to \p Order. The node at
+  /// Relocation.From must be Relocation.Node, and Relocation.To is its final
+  /// position in Result. Return false without modifying Result if the input
+  /// order or relocation is invalid.
+  bool applyRelocation(ArrayRef<unsigned> Order, Relocation Move,
+                       SmallVectorImpl<unsigned> &Result) const;
 };
 
 /// Adapter for schedulers that compute a complete schedule before LLVM begins

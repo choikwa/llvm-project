@@ -21,7 +21,6 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Error.h"
 #include <algorithm>
-#include <iterator>
 #include <string>
 
 #define DEBUG_TYPE "gcn-learned-schedule-optimizer"
@@ -51,25 +50,6 @@ static cl::opt<std::string>
                           cl::desc("Path to the frozen neural model blob"));
 
 namespace {
-
-GCNRegPressure getSchedulePressure(const MachineSchedSearchRegion &Region,
-                                   ArrayRef<unsigned> Order,
-                                   const LiveIntervals &LIS) {
-  const ScheduleDAGMI &DAG = *Region.getDAG();
-  MachineBasicBlock *MBB =
-      Region.getSUnit(Order.front()).getInstr()->getParent();
-  auto BBEnd = MBB->end();
-  GCNUpwardRPTracker Tracker(LIS);
-  if (DAG.end() != BBEnd) {
-    Tracker.reset(*DAG.end());
-    Tracker.recede(*DAG.end());
-  } else {
-    Tracker.reset(*std::prev(BBEnd));
-  }
-  for (unsigned Node : reverse(Order))
-    Tracker.recede(*Region.getSUnit(Node).getInstr());
-  return Tracker.getMaxPressureAndReset();
-}
 
 class GCNNeuralScheduleOptimizer final : public GCNCompleteScheduleOptimizer {
   MachineSchedContext &Context;
@@ -112,7 +92,7 @@ protected:
 
     const GCNSubtarget &ST = Context.MF->getSubtarget<GCNSubtarget>();
     GCNRegPressure FounderPressure =
-        getSchedulePressure(Region, Founder, *Context.LIS);
+        getGCNCompleteSchedulePressure(Region, Founder, *Context.LIS);
     float FounderVGPRs = FounderPressure.getVGPRNum(ST.hasGFX90AInsts());
     const ScheduleDAGMI &DAG = *Region.getDAG();
     LearnedPreRARegionFeatures Features(Region, Founder, *DAG.TII, *DAG.TRI,
@@ -141,7 +121,8 @@ protected:
     const GCNSubtarget &ST = Context.MF->getSubtarget<GCNSubtarget>();
     const unsigned DynamicVGPRBlockSize =
         Context.MF->getInfo<SIMachineFunctionInfo>()->getDynamicVGPRBlockSize();
-    GCNRegPressure Pressure = getSchedulePressure(Region, Result, *Context.LIS);
+    GCNRegPressure Pressure =
+        getGCNCompleteSchedulePressure(Region, Result, *Context.LIS);
     Context.MF->getInfo<SIMachineFunctionInfo>()->limitOccupancy(
         Pressure.getOccupancy(ST, DynamicVGPRBlockSize));
     return true;
