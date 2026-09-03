@@ -11,6 +11,8 @@
 // strategy through a replay adapter or refine the schedule materialized by an
 // existing strategy through ScheduleDAGMI's post-scheduling hook.
 //
+// See llvm/docs/MachineSchedCompleteScheduleSearch.md for integration examples.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CODEGEN_MACHINESCHEDSEARCH_H

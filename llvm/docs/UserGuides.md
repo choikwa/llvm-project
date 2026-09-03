@@ -45,6 +45,7 @@ InstrProfileFormat
 InstCombineContributorGuide
 WritingAnLLVMBackend
 CodeGenerator
+MachineSchedCompleteScheduleSearch
 TableGen/index
 MCJITDesignAndImplementation
 ORCv2
@@ -264,6 +265,11 @@ yaml2obj
   The design and implementation of the LLVM code generator.  Useful if you are
   working on retargetting LLVM to a new architecture, designing a new codegen
   pass, or enhancing existing components.
+
+- {doc}`MachineSchedCompleteScheduleSearch`
+
+  How to implement and integrate search-based or learned machine schedulers
+  that operate on complete instruction orders.
 
 - {doc}`TableGen <TableGen/index>`
 

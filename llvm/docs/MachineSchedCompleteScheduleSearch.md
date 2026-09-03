@@ -1,0 +1,311 @@
+# Complete-schedule search in the machine scheduler
+
+LLVM's usual machine-scheduling interface asks a `MachineSchedStrategy` to
+choose one ready `SUnit` at a time.  `MachineSchedCompleteScheduleOptimizer`
+supports a different kind of scheduler: one that explores complete instruction
+orders and returns one selected order.
+
+This interface is useful for search algorithms and learned optimizers whose
+natural state is a complete schedule.  It does not prescribe a search
+algorithm, scoring function, model, or training system.
+
+## Choose an integration point
+
+There are two ways to use a complete-schedule optimizer.
+
+**Refine an existing schedule (usually preferred).**  First run the target's
+normal scheduler, then give the materialized schedule to the optimizer as its
+founder.  Install the optimizer with
+`ScheduleDAGMI::setPostScheduleOptimizer()`.  This is the appropriate path when
+the search or model was trained relative to a particular production scheduler.
+
+```text
+build DAG -> normal scheduler -> complete founder -> optimizer -> final order
+```
+
+**Replace the scheduling strategy.**  Wrap the optimizer in
+`MachineSchedCompleteScheduleReplayer`.  The optimizer receives the DAG's
+initial ordinal order (or a stable topological order when that order is not
+legal), and the selected complete schedule is replayed through LLVM's normal
+incremental scheduling machinery.
+
+```text
+build DAG -> complete-schedule optimizer -> replay selected order
+```
+
+In both cases LLVM validates the returned permutation and every strong DAG
+dependency before changing the instruction stream.  Returning `false`, or
+returning an invalid order, preserves the founder.
+
+## Implement an optimizer
+
+Include `llvm/CodeGen/MachineSchedSearch.h` and derive from
+`MachineSchedCompleteScheduleOptimizer`:
+
+```cpp
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/CodeGen/MachineSchedSearch.h"
+
+using namespace llvm;
+
+class EarliestLegalMove final
+    : public MachineSchedCompleteScheduleOptimizer {
+public:
+  bool optimizeCompleteSchedule(const MachineSchedSearchRegion &Region,
+                                ArrayRef<unsigned> Founder,
+                                SmallVectorImpl<unsigned> &Result) override {
+    Result.assign(Founder.begin(), Founder.end());
+
+    // A real implementation would select this node and destination using a
+    // cost model, stochastic search, or learned policy.  This example performs
+    // the first nontrivial legal move it finds.
+    for (unsigned Node : Founder) {
+      MachineSchedSearchRegion::MoveRange Range;
+      if (!Region.getLegalMoveRange(Result, Node, Range))
+        return false;
+
+      unsigned OldPosition = llvm::find(Result, Node) - Result.begin();
+      if (Range.Begin == OldPosition)
+        continue;
+
+      Result.erase(Result.begin() + OldPosition);
+      Result.insert(Result.begin() + Range.Begin, Node);
+      return true;
+    }
+    return false;
+  }
+};
+```
+
+`Founder` and `Result` are permutations of **region-local SUnit ordinals** in
+the range `[0, Region.size())`.  An ordinal is a stable identity for one node;
+it is not the node's position in `Founder`, and it need not equal
+`SUnit::NodeNum`.  For example:
+
+```text
+SUnit ordinal:        7
+position in Founder: 12
+position in Result:   4
+```
+
+Useful operations on `MachineSchedSearchRegion` include:
+
+- `getSUnit(Node)` to inspect the `SUnit` and its `MachineInstr`;
+- `predecessors(Node)` and `successors(Node)` for strong dependencies;
+- `isLegalOrder(Order)` for complete permutation and dependency validation;
+- `getLegalMoveRange(Order, Node, Range)` for a dependency-preserving
+  remove-and-reinsert mutation; and
+- `getInitialOrder()` and `getTopologicalOrder()` for deterministic starting
+  orders.
+
+Weak DAG edges are scheduling preferences, not legality constraints.  A target
+with additional constraints may override `validateCompleteSchedule()`.  Such a
+validator should reject a candidate rather than silently repair it, so search
+results remain reproducible and diagnosable.
+
+The search callback must not mutate the `MachineFunction`, `SUnit` storage, or
+the DAG.  It may inspect them through `Region`; `Region.getDAG()` is non-null
+when the view was constructed for a live scheduler DAG.  LLVM applies only the
+selected result and repairs generic liveness information afterward.
+
+## Refine the output of an existing scheduler
+
+A target DAG can install a post-schedule optimizer before it is returned from
+`TargetMachine::createMachineScheduler()`:
+
+```cpp
+ScheduleDAGInstrs *MyTargetMachine::createMachineScheduler(
+    MachineSchedContext *C) const {
+  auto *DAG = new ScheduleDAGMILive(C, std::make_unique<MySchedStrategy>(C));
+  DAG->setPostScheduleOptimizer(std::make_unique<EarliestLegalMove>());
+  return DAG;
+}
+```
+
+The callback runs once for each completed scheduling region.  Its founder is
+the order that `MySchedStrategy` actually materialized, expressed using the
+stable region-local ordinals.  The post-schedule hook is skipped if scheduling
+was cut off before the region was completed.
+
+`ScheduleDAGMILive` moves the selected instructions and, when liveness and
+pressure tracking are active, recomputes the generic liveness flags needed by
+the changed order.  Targets whose final order changes additional metadata can
+override `applyCompleteSchedule()`, perform their target-specific update, and
+delegate instruction movement and generic liveness maintenance to the base
+implementation.
+
+## Use an optimizer as the scheduling strategy
+
+To search from the DAG's initial legal order instead of refining another
+scheduler's result, use the replay adapter:
+
+```cpp
+ScheduleDAGInstrs *MyTargetMachine::createMachineScheduler(
+    MachineSchedContext *C) const {
+  auto Strategy = std::make_unique<MachineSchedCompleteScheduleReplayer>(
+      std::make_unique<EarliestLegalMove>());
+  return new ScheduleDAGMILive(C, std::move(Strategy));
+}
+```
+
+The adapter computes the complete result before list scheduling begins.  It
+then returns the selected nodes top-down, one at a time, so instruction motion,
+ready-queue state, live intervals, and register-pressure bookkeeping remain in
+the existing scheduler framework.
+
+This adapter is not intended for algorithms that naturally choose one ready
+node at a time.  Those algorithms should implement `MachineSchedStrategy`
+directly.
+
+## AMDGPU post-MaxOccupancy use
+
+AMDGPU provides `GCNCompleteScheduleOptimizer` and
+`createGCNPostScheduleOptimizerScheduler()` in
+`lib/Target/AMDGPU/GCNCompleteScheduleOptimizer.h`.  This path runs the normal
+GCN scheduling stages first and presents their post-MaxOccupancy schedule as
+the founder:
+
+```cpp
+class MyGCNOptimizer final : public GCNCompleteScheduleOptimizer {
+  bool optimizeGCNCompleteSchedule(const MachineSchedSearchRegion &Region,
+                                   ArrayRef<unsigned> Founder,
+                                   SmallVectorImpl<unsigned> &Result) override {
+    // Search complete orders here.
+    Result.assign(Founder.begin(), Founder.end());
+    return false;
+  }
+};
+
+ScheduleDAGInstrs *createMyGCNScheduler(MachineSchedContext *C) {
+  return createGCNPostScheduleOptimizerScheduler(
+      C, std::make_unique<MyGCNOptimizer>());
+}
+```
+
+The AMDGPU adapter enables lane-mask and register-pressure tracking during
+replay and preserves local virtual-register def/use relationships that are not
+yet represented by strong DAG edges.  A derived optimizer may add further
+target-specific checks in `validateGCNCompleteSchedule()`.
+
+The complete-order callback is where a static simulated annealer, beam search,
+greedy policy, or another in-process optimizer is selected.  The base API does
+not contain a search-mode enum: search algorithms are clients of the API, not
+policies built into it.
+
+A static simulated annealer, for example, can be structured entirely inside
+the callback:
+
+```text
+current = best = Founder
+repeat until the static-evaluation budget is exhausted:
+  choose a node and query getLegalMoveRange(current, node)
+  construct one remove-and-reinsert child
+  score (current, action, child) with the frozen static scorer
+  accept the child according to the chosen annealing rule
+  update best
+Result = best
+```
+
+The same callback can instead call a beam-search or learned-policy library.  In
+all cases it should return the best complete legal order it selected, not its
+internal search state.
+
+## Run the experimental AMDGPU neural optimizer
+
+The current AMDGPU client implements iterative complete-schedule search with a
+frozen C33 shared neural model.  It is experimental, is restricted to `gfx950`,
+and is disabled by default.
+
+First export a compatible PyTorch checkpoint to LLVM's native model format:
+
+```console
+$ python3 llvm/utils/export-amdgpu-prera-nn.py \
+    /path/to/NN_SHARED_MEDIUM_TRITON_L0_seed221202.pt \
+    /path/to/model.amdprann
+```
+
+The exporter requires Python, NumPy, and PyTorch.  LLVM itself does not.  The
+native blob contains the normalization data, dense-network parameters, source
+checkpoint SHA-256, and feature-schema SHA-256.
+
+Then invoke `llc`:
+
+```console
+$ build/bin/llc input.ll -o output.s \
+    -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 \
+    -amdgpu-learned-prera-sched \
+    -amdgpu-learned-prera-model=/absolute/path/to/model.amdprann \
+    -amdgpu-learned-prera-budget=131072 \
+    -amdgpu-learned-prera-seed=2212
+```
+
+The budget is the maximum number of statically scored candidates.  The seed
+controls deterministic proposal generation; it does not start multiple search
+chains.  `-amdgpu-learned-prera-region=N` can restrict an investigation to one
+scheduler region.  If the model is absent, invalid, incompatible, or the target
+is not `gfx950`, the production schedule is preserved.
+
+This search performs no hardware measurements.  It extracts 22 complete-state
+features and 55 parent/action/child features, runs native float32 inference,
+and iteratively retains promising complete schedules.
+
+## Training and hardware-in-the-loop search
+
+The API can be used while generating training data, but it is not a training
+framework.  A data-collection optimizer can enumerate or sample complete legal
+orders, compute static labels or features, and serialize those records from
+`optimizeCompleteSchedule()`.  Model training remains an external step.  A
+model whose input schema or label semantics change must be retrained and
+exported with a matching schema identifier; merely moving the same optimizer
+behind this API does not require retraining.
+
+Hardware-in-the-loop search also requires an external persistent controller.
+The in-process callback is synchronous: LLVM expects it to return a selected
+order before compilation continues.  The current API supplies the schedule
+representation, legality checks, replay, and target bookkeeping, but it does
+not define a compiler/controller protocol, launch GPU workloads, feed runtime
+measurements back to a search, or implement simulated-annealing acceptance.
+
+A hardware-in-the-loop system can use this API as its compiler-side endpoint:
+
+1. Freeze or serialize the scheduling region and founder.
+2. Have the external controller propose complete ordinal orders or legal
+   relocations.
+3. Recompile/replay each candidate through a client optimizer.
+4. Run and measure the candidate externally.
+5. Feed the runtime to the persistent controller, which chooses the next
+   proposal.
+6. Replay the controller's selected order for the final compilation.
+
+Defining that transport and persistence protocol is intentionally separate
+from the generic machine-scheduler API.
+
+## Facilities intentionally not supplied by the base API
+
+The current interface does not provide:
+
+- a global registry or command-line enum for choosing a search algorithm;
+- a generic feature schema, objective, model format, or inference engine;
+- candidate logging or trajectory serialization;
+- a wire protocol for an external controller; or
+- hardware execution and runtime feedback.
+
+Those components have target-, experiment-, and deployment-specific ownership.
+A target can expose its own registry or command-line option and construct the
+corresponding `MachineSchedCompleteScheduleOptimizer`.  If several targets
+later need the same facility, it can be promoted independently without
+coupling the complete-order representation to one search method.
+
+## Correctness checklist
+
+Before enabling a new optimizer by default, verify all of the following:
+
+- every result is a complete permutation of `[0, Region.size())`;
+- every result passes `Region.isLegalOrder()`;
+- target constraints missing from strong DAG edges have an explicit validator;
+- the same DAG mutations are installed in training and deployment;
+- the founder scheduler and scheduling phase match those used to collect data;
+- liveness, lane-mask, pressure, occupancy, and spill-sensitive behavior are
+  checked for the target;
+- invalid models and rejected candidates preserve the founder exactly; and
+- final schedules pass `-verify-machineinstrs` and target CodeGen tests.
