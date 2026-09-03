@@ -360,6 +360,52 @@ The controller can remain a normal script launching one compiler process per
 candidate.  A persistent compiler worker or RPC transport could reduce startup
 cost, but is an optional optimization rather than a requirement.
 
+### Basic hardware-in-the-loop SA controller
+
+`llvm/utils/amdgpu-prera-hitl-sa.py` is a small reference controller for the
+process-per-candidate workflow.  It records the post-MaxOccupancy founder,
+generates exact-depth legal relocation walks, verifies every selected endpoint
+by replaying it through a second compiler invocation, and performs serial
+Metropolis acceptance using measured hardware runtime.
+
+The controller deliberately does not know how to launch a particular kernel.
+The command after `--benchmark-command` is supplied by the experiment and must
+print one JSON object:
+
+```json
+{"baseline_runtime_us": 10.0, "candidate_runtime_us": 9.5, "correct": true}
+```
+
+The benchmark should measure the frozen founder and candidate in the same
+invocation, preferably interleaved.  The annealing energy is the normalized
+ratio `candidate_runtime_us / baseline_runtime_us`, which reduces sensitivity
+to clock and thermal drift between evaluations.  The command supports
+`{baseline}`, `{candidate}`, `{function}`, `{region}`, and `{output_dir}`
+placeholders and is executed directly without a shell.
+
+For example:
+
+```console
+$ export ROCR_VISIBLE_DEVICES=7
+$ python3 llvm/utils/amdgpu-prera-hitl-sa.py \
+    --llc build/bin/llc \
+    --input kernel.ll \
+    --function matmul_kernel \
+    --region 6 \
+    --output-dir hitl-sa-run \
+    --budget 16 \
+    --depths 1,2,4,8 \
+    --seed 17 \
+    --benchmark-command python3 benchmark.py \
+      --baseline '{baseline}' --candidate '{candidate}'
+```
+
+The output contains a frozen configuration, append-only `search.jsonl`, a
+summary, all compiler-emitted trajectories, and copies of the final current
+and best schedules.  The compiler-side trajectory has structural features and
+pressure observations; `search.jsonl` adds the hardware measurements and
+accept/reject decisions needed to construct supervised datasets later.
+
 ## Facilities intentionally not supplied by the base API
 
 The generic interface does not provide:

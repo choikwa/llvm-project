@@ -1,0 +1,81 @@
+# RUN: rm -rf %t.dir %t.out
+# RUN: split-file %s %t.dir
+# RUN: chmod +x %t.dir/fake-llc.py
+# RUN: %python %S/../../../utils/amdgpu-prera-hitl-sa.py \
+# RUN:   --llc %t.dir/fake-llc.py --input %t.dir/input.ll \
+# RUN:   --function kernel --region 0 --output-dir %t.out \
+# RUN:   --artifact-kind object --budget 3 --depths 1,2 --seed 7 \
+# RUN:   --benchmark-command %python %t.dir/fake-benchmark.py \
+# RUN:     --baseline {baseline} --candidate {candidate} | FileCheck %s
+# RUN: test -f %t.out/best.schedule
+# RUN: test -f %t.out/current.schedule
+# RUN: grep '"kind": "proposal"' %t.out/search.jsonl | FileCheck %s --check-prefix=EVENTS
+# RUN: test -f %t.out/candidates/e000001-a00-d1/compiler-trajectory.jsonl
+# RUN: test -f %t.out/candidates/e000002-a00-d2/compiler-trajectory.jsonl
+# RUN: test -f %t.out/candidates/e000003-a00-d1/compiler-trajectory.jsonl
+
+# CHECK: "best_runtime_ratio": 0.9
+# CHECK: "best_speedup_pct": 11.111111111111116
+# CHECK: "compiler_invocations": 7
+# CHECK: "evaluations": 3
+# CHECK: "hardware_evaluations": 4
+# CHECK: "status": "complete"
+
+# EVENTS: "accepted": true
+# EVENTS-NEXT: "accepted": false
+# EVENTS-NEXT: "accepted": false
+
+#--- input.ll
+; The fake compiler only needs a stable input path.
+
+#--- fake-llc.py
+#!/usr/bin/env python3
+import json
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+
+def option(name):
+    prefix = name + "="
+    return next((arg[len(prefix):] for arg in args if arg.startswith(prefix)), None)
+
+output = Path(args[args.index("-o") + 1])
+record = Path(option("-amdgpu-prera-training-record-schedule"))
+trajectory_text = option("-amdgpu-prera-training-record-trajectory")
+replay_text = option("-amdgpu-prera-training-replay-schedule")
+seed = option("-amdgpu-prera-training-seed")
+if replay_text:
+    schedule = Path(replay_text).read_text()
+else:
+    schedule = "amdgpu-prera-schedule-v1\tkernel\t0\tfingerprint\t0,1,2\n"
+if seed:
+    schedule = schedule.rstrip() + f"\n# mutation {seed}\n"
+record.write_text(schedule)
+if trajectory_text:
+    Path(trajectory_text).write_text(json.dumps({
+        "kind": "state", "role": "founder", "region": 0,
+        "order": [0, 1, 2],
+    }) + "\n")
+output.write_text(schedule)
+
+#--- fake-benchmark.py
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--baseline", type=Path, required=True)
+parser.add_argument("--candidate", type=Path, required=True)
+args = parser.parse_args()
+if args.baseline == args.candidate:
+    candidate = 100.0
+else:
+    mutations = args.candidate.read_text().count("# mutation")
+    candidate = 90.0 if mutations == 1 else 110.0
+print(json.dumps({
+    "baseline_runtime_us": 100.0,
+    "candidate_runtime_us": candidate,
+    "correct": True,
+}))
