@@ -1212,6 +1212,7 @@ void GCNScheduleDAGMILive::finalizeSchedule() {
   RegionsWithIGLPInstrs.reset();
 
   runSchedStages();
+  finalizeGCNSchedule();
 }
 
 void GCNScheduleDAGMILive::runSchedStages() {

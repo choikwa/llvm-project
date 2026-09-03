@@ -40,6 +40,7 @@
 #include "AMDGPUTargetTransformInfo.h"
 #include "AMDGPUUnifyDivergentExitNodes.h"
 #include "AMDGPUWaitSGPRHazards.h"
+#include "GCNCompleteScheduleOptimizer.h"
 #include "GCNDPPCombine.h"
 #include "GCNIterativeScheduler.h"
 #include "GCNNSAReassign.h"
@@ -1415,6 +1416,9 @@ GCNTargetMachine::createMachineScheduler(MachineSchedContext *C) const {
   const GCNSubtarget &ST = C->MF->getSubtarget<GCNSubtarget>();
   if (ST.enableSIScheduler())
     return createSIMachineScheduler(C);
+
+  if (AMDGPU::isGCNNeuralScheduleEnabled() && ST.getCPU() == "gfx950")
+    return AMDGPU::createGCNNeuralPostScheduler(C);
 
   StringRef SchedStrategy = AMDGPU::getSchedStrategy(C->MF->getFunction());
 

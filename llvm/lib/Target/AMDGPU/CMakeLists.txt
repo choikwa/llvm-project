@@ -64,6 +64,10 @@ add_llvm_target(AMDGPUCodeGen
   AMDGPUHWEvents.cpp
   AMDGPUInsertDelayAlu.cpp
   AMDGPUInstCombineIntrinsic.cpp
+  AMDGPULearnedFeatures.cpp
+  AMDGPULearnedModelFormat.cpp
+  AMDGPULearnedPreRAAdvisor.cpp
+  AMDGPULearnedPreRAScheduler.cpp
   AMDGPUUniformIntrinsicCombine.cpp
   AMDGPUInstrInfo.cpp
   AMDGPUInstructionSelector.cpp
@@ -126,7 +130,9 @@ add_llvm_target(AMDGPUCodeGen
   AMDGPUUnifyDivergentExitNodes.cpp
   R600MachineCFGStructurizer.cpp
   GCNCreateVOPD.cpp
+  GCNCompleteScheduleOptimizer.cpp
   GCNDPPCombine.cpp
+  GCNLearnedScheduleOptimizer.cpp
   GCNHazardRecognizer.cpp
   GCNILPSched.cpp
   GCNIterativeScheduler.cpp
