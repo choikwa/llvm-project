@@ -1,0 +1,41 @@
+# RUN: split-file %s %t.dir
+# RUN: chmod +x %t.dir/ssh
+# RUN: env PATH="%t.dir%{pathsep}%{PATH}" %python \
+# RUN:   %S/../../../utils/aarch64-hitl-remote.py --host doge@pi3doge \
+# RUN:   --baseline %t.dir/artifact --candidate %t.dir/artifact --cpu 3 \
+# RUN:   --remote-command benchmark --baseline {remote_baseline} \
+# RUN:     --candidate {remote_candidate} | FileCheck %s
+
+# CHECK: "baseline_runtime_us": 10.0
+# CHECK: "candidate_runtime_us": 9.5
+# CHECK: "correct": true
+# CHECK: "remote_cpu": 3
+# CHECK: "stable": true
+# CHECK: "currently_throttled": false
+# CHECK: "frequency_khz": 1400000
+# CHECK: "temperature_millic": 43000
+# CHECK: "throttled": 524288
+
+#--- artifact
+mock object
+
+#--- ssh
+#!/usr/bin/python3
+import json
+import sys
+
+command = sys.argv[-1]
+if "scaling_cur_freq" in command:
+    print("frequency_khz=1400000")
+    print("temperature_millic=43000")
+    print("throttled=0x80000")
+elif "taskset" in command:
+    print(json.dumps({
+        "baseline_runtime_us": 10.0,
+        "candidate_runtime_us": 9.5,
+        "correct": True,
+    }))
+elif "test -f" in command:
+    raise SystemExit(1)
+else:
+    sys.stdin.buffer.read()

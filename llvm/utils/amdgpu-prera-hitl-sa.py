@@ -154,8 +154,10 @@ class Controller:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.output = args.output_dir.resolve()
-        if self.output.exists() and any(self.output.iterdir()):
+        if self.output.exists() and any(self.output.iterdir()) and not args.resume:
             raise RuntimeError(f"output directory is not empty: {self.output}")
+        if args.resume and not self.output.exists():
+            raise RuntimeError(f"resume output directory does not exist: {self.output}")
         self.output.mkdir(parents=True, exist_ok=True)
         self.events = self.output / "search.jsonl"
         self.rng = random.Random(args.seed)
@@ -164,6 +166,69 @@ class Controller:
         self.hardware_evaluations = 0
         self.compile_seconds = 0.0
         self.benchmark_seconds = 0.0
+
+    def configuration(self) -> dict[str, Any]:
+        config = vars(self.args).copy()
+        config.pop("resume", None)
+        config.update(
+            llc=str(self.args.llc),
+            ld_lld=str(self.args.ld_lld),
+            input=str(self.args.input),
+            input_sha256=sha256(self.args.input),
+            output_dir=str(self.output),
+            depths=list(self.args.depths),
+        )
+        return config
+
+    def resume_state(self):
+        config_path = self.output / "config.json"
+        if not config_path.is_file() or not self.events.is_file():
+            raise RuntimeError("resume requires config.json and search.jsonl")
+        saved_config = json.loads(config_path.read_text())
+        current_config = self.configuration()
+        # Extending a completed or interrupted run's evaluation budget is safe;
+        # all proposal and acceptance randomness before the old budget is fixed.
+        for config in (saved_config, current_config):
+            config.pop("budget", None)
+        if saved_config != current_config:
+            raise RuntimeError("resume configuration does not match the frozen run")
+
+        records = [json.loads(line) for line in self.events.read_text().splitlines()]
+        founder = next((record for record in records
+                        if record.get("kind") == "founder"), None)
+        if founder is None:
+            raise RuntimeError("resume log does not contain a founder")
+        current = founder
+        best = founder
+        evaluations = 0
+        duplicates = 0
+        seen = {founder["schedule_sha256"]}
+        for record in records:
+            kind = record.get("kind")
+            if kind == "duplicate":
+                duplicates += 1
+                if "schedule_sha256" in record:
+                    seen.add(record["schedule_sha256"])
+            elif kind == "proposal":
+                evaluations += 1
+                seen.add(record["schedule_sha256"])
+                if record.get("correct") and (
+                    float(record["runtime_ratio"]) < float(best["runtime_ratio"])
+                ):
+                    best = record
+                if record.get("accepted"):
+                    current = record
+                # Restore Random's state without depending on serialized internals.
+                self.rng.random()
+
+        summary_path = self.output / "summary.json"
+        if summary_path.is_file():
+            old_summary = json.loads(summary_path.read_text())
+            self.compiler_invocations = int(old_summary.get("compiler_invocations", 0))
+            self.hardware_evaluations = int(old_summary.get("hardware_evaluations", 0))
+            self.compile_seconds = float(old_summary.get("compile_seconds", 0.0))
+            self.benchmark_seconds = float(old_summary.get("benchmark_seconds", 0.0))
+        return founder, current, best, evaluations, duplicates, seen
 
     def llc_command(
         self,
@@ -226,7 +291,11 @@ class Controller:
             "region": str(self.args.region),
             "output_dir": str(directory),
         }
-        command = [argument.format_map(replacements) for argument in self.args.benchmark_command]
+        command = []
+        for argument in self.args.benchmark_command:
+            for key, replacement in replacements.items():
+                argument = argument.replace("{" + key + "}", replacement)
+            command.append(argument)
         result = run_command(command, directory / "benchmark.log", self.args.timeout)
         self.hardware_evaluations += 1
         self.benchmark_seconds += result.wall_seconds
@@ -339,23 +408,22 @@ class Controller:
         }
 
     def run(self) -> dict[str, Any]:
-        config = vars(self.args).copy()
-        config.update(
-            llc=str(self.args.llc),
-            ld_lld=str(self.args.ld_lld),
-            input=str(self.args.input),
-            output_dir=str(self.output),
-            depths=list(self.args.depths),
+        if self.args.resume:
+            founder, current, best, evaluations, duplicates, seen = (
+                self.resume_state()
+            )
+        else:
+            write_json(self.output / "config.json", self.configuration())
+            founder = self.compile_founder()
+            current = founder
+            best = founder
+            seen = {founder["schedule_sha256"]}
+            evaluations = 0
+            duplicates = 0
+        temperature = max(
+            self.args.temperature_floor,
+            self.args.temperature * self.args.cooling ** evaluations,
         )
-        write_json(self.output / "config.json", config)
-
-        founder = self.compile_founder()
-        current = founder
-        best = founder
-        seen = {founder["schedule_sha256"]}
-        evaluations = 0
-        duplicates = 0
-        temperature = self.args.temperature
 
         while evaluations < self.args.budget:
             depth = self.args.depths[evaluations % len(self.args.depths)]
@@ -462,6 +530,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--cooling", type=float, default=0.985)
     result.add_argument("--temperature-floor", type=float, default=0.0005)
     result.add_argument("--max-proposal-attempts", type=int, default=16)
+    result.add_argument("--resume", action="store_true")
     result.add_argument("--timeout", type=int, default=1200)
     result.add_argument("--triple", default="amdgcn-amd-amdhsa")
     result.add_argument("--mcpu", default="gfx950")

@@ -15,6 +15,7 @@
 #include "AArch64MachineFunctionInfo.h"
 #include "AArch64MachineScheduler.h"
 #include "AArch64MacroFusion.h"
+#include "AArch64ScheduleTraining.h"
 #include "AArch64Subtarget.h"
 #include "AArch64TargetObjectFile.h"
 #include "AArch64TargetTransformInfo.h"
@@ -532,6 +533,15 @@ AArch64TargetMachine::createMachineScheduler(MachineSchedContext *C) const {
   if (ST.hasSME() && ST.isStreaming())
     DAG->addMutation(createMacroFusionDAGMutation(
         scheduleFormTransposedTupleAdjacentToUsers));
+
+  if (AArch64::isScheduleTrainingEnabled()) {
+    if (ST.getCPU() != "cortex-a53")
+      report_fatal_error(
+          "AArch64 pre-RA training endpoint currently requires cortex-a53");
+    DAG->setPostScheduleOptimizer(
+        AArch64::createScheduleTrainingOptimizer(C));
+  }
+
   return DAG;
 }
 

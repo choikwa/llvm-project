@@ -406,6 +406,43 @@ and best schedules.  The compiler-side trajectory has structural features and
 pressure observations; `search.jsonl` adds the hardware measurements and
 accept/reject decisions needed to construct supervised datasets later.
 
+### Cortex-A53 pre-RA search over SSH
+
+AArch64 provides an experimental pre-RA record/replay and mutation endpoint
+for `cortex-a53`.  The corresponding controller keeps compilation and SA state
+on the host while a benchmark command measures objects on the target board.
+This places search after the normal AArch64 pre-RA scheduling strategy has
+produced a complete founder schedule and before physical-register allocation.
+
+`llvm/utils/aarch64-hitl-remote.py` caches objects by SHA-256 on the remote
+machine, pins the supplied benchmark to one CPU, and records frequency,
+temperature, and Raspberry Pi throttling telemetry around each invocation.
+Only times reported by the remote benchmark enter the SA objective; SSH and
+file-transfer latency do not.
+
+The reference native runner expects each object to export
+`uint64_t hitl_kernel(uint64_t seed, uint64_t iterations)`.  Install
+`aarch64-hitl-runner.c` and `aarch64-hitl-link-and-run.py` on the board, then
+use the remote adapter as the controller's benchmark command:
+
+```console
+$ python3 llvm/utils/aarch64-prera-hitl-sa.py \
+    --llc build/bin/llc --input kernel.ll --function hitl_kernel --region 0 \
+    --output-dir a53-hitl --budget 16 --depths 1,2,4,8 --seed 17 \
+    --llc-arg=-relocation-model=pic \
+    --benchmark-command python3 llvm/utils/aarch64-hitl-remote.py \
+      --host doge@pi3doge --baseline '{baseline}' --candidate '{candidate}' \
+      --remote-command /path/to/aarch64-hitl-link-and-run.py \
+        --baseline '{remote_baseline}' --candidate '{remote_candidate}' \
+        --runner /path/to/aarch64-hitl-runner
+```
+
+The remote command must compare founder and candidate in one invocation and
+print the same benchmark JSON consumed by the generic controller.  The
+reference runner uses `CLOCK_MONOTONIC_RAW`, warmups, alternating execution
+order, median runtimes, and output equality checking.  A currently throttled
+measurement is recorded and retried rather than used for acceptance.
+
 ## Facilities intentionally not supplied by the base API
 
 The generic interface does not provide:
