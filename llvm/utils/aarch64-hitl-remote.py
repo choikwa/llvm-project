@@ -117,6 +117,23 @@ def benchmark_record(stdout: str) -> dict[str, Any]:
     return value
 
 
+def samples_are_stable(record: dict[str, Any], max_ratio: float) -> bool:
+    for key in ("baseline_samples_us", "candidate_samples_us"):
+        samples = record.get(key)
+        if samples is None:
+            continue
+        if not isinstance(samples, list) or not samples:
+            raise RuntimeError(f"remote benchmark {key} must be a non-empty array")
+        values = [float(sample) for sample in samples]
+        if any(not math.isfinite(sample) or sample <= 0 for sample in values):
+            raise RuntimeError(
+                f"remote benchmark {key} values must be positive and finite"
+            )
+        if max(values) / min(values) > max_ratio:
+            return False
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", required=True)
@@ -124,11 +141,17 @@ def main() -> None:
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--remote-dir", default="/tmp/llvm-aarch64-hitl")
     parser.add_argument("--cpu", type=int, default=3)
+    parser.add_argument(
+        "--max-sample-ratio", type=float, default=1.10,
+        help="mark measurements unstable when max/min sample time exceeds this",
+    )
     parser.add_argument("--ssh-option", action="append", default=[])
     parser.add_argument("--remote-command", nargs=argparse.REMAINDER, required=True)
     args = parser.parse_args()
     if args.cpu < 0:
         raise SystemExit("--cpu must be non-negative")
+    if not math.isfinite(args.max_sample_ratio) or args.max_sample_ratio < 1:
+        raise SystemExit("--max-sample-ratio must be finite and at least 1")
     if not args.remote_command:
         raise SystemExit("--remote-command requires a command")
     remote_dir = PurePosixPath(args.remote_dir)
@@ -170,7 +193,8 @@ def main() -> None:
             telemetry_before=before,
             telemetry_after=after,
             stable=not before["currently_throttled"]
-            and not after["currently_throttled"],
+            and not after["currently_throttled"]
+            and samples_are_stable(record, args.max_sample_ratio),
         )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"error: {error}", file=sys.stderr)

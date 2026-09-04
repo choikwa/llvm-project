@@ -246,25 +246,3 @@ void ScheduleDAGMI::applyCompleteSchedule(ArrayRef<unsigned> Order) {
     InsertPos = std::next(MI->getIterator());
   }
 }
-
-void ScheduleDAGMILive::applyCompleteSchedule(ArrayRef<unsigned> Order) {
-  ScheduleDAGMI::applyCompleteSchedule(Order);
-  if (!ShouldTrackPressure)
-    return;
-
-  for (unsigned Node : Order) {
-    MachineInstr *MI = SUnits[Node].getInstr();
-    // A prior ordering may have introduced read-undef flags that are no longer
-    // valid. Recompute them together with the other liveness flags below.
-    for (MachineOperand &Op : MI->all_defs())
-      Op.setIsUndef(false);
-
-    RegisterOperands RegOpers;
-    RegOpers.collect(*MI, *TRI, MRI, ShouldTrackLaneMasks,
-                     /*IgnoreDead=*/false);
-    if (ShouldTrackLaneMasks)
-      RegOpers.adjustLaneLiveness(*LIS, MRI, *MI);
-    else
-      RegOpers.detectDeadDefs(*MI, *LIS);
-  }
-}

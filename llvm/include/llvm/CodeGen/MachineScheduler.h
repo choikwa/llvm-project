@@ -473,8 +473,6 @@ protected:
 /// machine instructions while updating LiveIntervals and tracking regpressure.
 class LLVM_ABI ScheduleDAGMILive : public ScheduleDAGMI {
 protected:
-  void applyCompleteSchedule(ArrayRef<unsigned> Order) override;
-
   RegisterClassInfo *RegClassInfo;
 
   /// Information about DAG subtrees. If DFSResult is NULL, then SchedulerTrees

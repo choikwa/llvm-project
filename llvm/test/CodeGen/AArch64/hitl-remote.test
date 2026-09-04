@@ -4,7 +4,12 @@
 # RUN:   %S/../../../utils/aarch64-hitl-remote.py --host doge@pi3doge \
 # RUN:   --baseline %t.dir/artifact --candidate %t.dir/artifact --cpu 3 \
 # RUN:   --remote-command benchmark --baseline {remote_baseline} \
-# RUN:     --candidate {remote_candidate} | FileCheck %s
+# RUN:     --candidate {remote_candidate} --samples stable | FileCheck %s
+# RUN: env PATH="%t.dir%{pathsep}%{PATH}" %python \
+# RUN:   %S/../../../utils/aarch64-hitl-remote.py --host doge@pi3doge \
+# RUN:   --baseline %t.dir/artifact --candidate %t.dir/artifact --cpu 3 \
+# RUN:   --remote-command benchmark --samples unstable | FileCheck %s \
+# RUN:     --check-prefix=UNSTABLE
 
 # CHECK: "baseline_runtime_us": 10.0
 # CHECK: "candidate_runtime_us": 9.5
@@ -15,6 +20,7 @@
 # CHECK: "frequency_khz": 1400000
 # CHECK: "temperature_millic": 43000
 # CHECK: "throttled": 524288
+# UNSTABLE: "stable": false
 
 #--- artifact
 mock object
@@ -30,9 +36,12 @@ if "scaling_cur_freq" in command:
     print("temperature_millic=43000")
     print("throttled=0x80000")
 elif "taskset" in command:
+    unstable = "unstable" in command
     print(json.dumps({
         "baseline_runtime_us": 10.0,
         "candidate_runtime_us": 9.5,
+        "baseline_samples_us": [10.0, 12.0 if unstable else 10.5],
+        "candidate_samples_us": [9.5, 9.6],
         "correct": True,
     }))
 elif "test -f" in command:
